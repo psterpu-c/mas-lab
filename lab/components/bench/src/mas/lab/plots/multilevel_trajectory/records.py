@@ -25,11 +25,15 @@ def _build_call_records(events: list[dict]) -> list[dict]:
         start_ts, end_ts, input, output, label, tool_name, model
 
     When the runtime emits ``call_id`` / ``parent_call_id`` on the event
-    (observability_plugin ≥ v2), those values are used verbatim.  Older
-    traces that lack these fields fall back to synthetic ids so that
-    ``_build_call_tree`` can still use its timestamp-containment path.
+    (observability_plugin ≥ v2), those values are used verbatim — a ``_start``
+    and its ``_end`` are paired by that shared call_id directly (``open_by_id``
+    below), never by comparing agent/type/name/timestamp. Older traces that
+    lack ``call_id`` entirely fall back to a synthetic per-key FIFO pairing
+    (``open_calls``) so ``_build_call_tree`` still has something to work with,
+    but this path is never used once the runtime assigns real ids.
     """
     records: list[dict] = []
+    open_by_id: dict[str, dict] = {}
     open_calls: dict[tuple, list[dict]] = defaultdict(list)
     call_seq:   dict[tuple, int]        = defaultdict(int)
     # The native observability layer emits each engine op (LLM/tool/memory)
@@ -126,10 +130,15 @@ def _build_call_records(events: list[dict]) -> list[dict]:
                 ev = {**ev, "messages": _mc}
 
         if kind.endswith("_start"):
-            seq = call_seq[key]
-            call_seq[key] += 1
+            _real_id = ev.get("call_id")
+            if _real_id:
+                call_id = _real_id
+            else:
+                seq = call_seq[key]
+                call_seq[key] += 1
+                call_id = f"{kind_base}-{agent_id}-{seq}"
             record: dict[str, Any] = {
-                "call_id":        ev.get("call_id") or f"{kind_base}-{agent_id}-{seq}",
+                "call_id":        call_id,
                 "parent_call_id": ev.get("parent_call_id"),  # None for roots / old traces
                 "_has_ids":  "call_id" in ev,  # True when runtime emitted the field
                 "call_type": call_type,
@@ -221,22 +230,41 @@ def _build_call_records(events: list[dict]) -> list[dict]:
                     + (f" · wm={wm}" if wm is not None else "")
                     + (f" · hist={committed}" if committed is not None else "")
                 )
-            open_calls[key].append(record)
+            if _real_id:
+                if call_id in open_by_id:
+                    # The runtime reused this exact call_id for a NEW
+                    # invocation while the previous one under it was still
+                    # open (e.g. one agent delegated to repeatedly within a
+                    # single turn, all turns sharing the coarser
+                    # "{agent_id}-{turn_id}-exec" id) — a real, documented
+                    # runtime behavior, not a bug in this parser. The prior
+                    # invocation genuinely never got its own end while it was
+                    # open, so flush it now (the same outcome the end-of-
+                    # function _end_missing sweep would give it) instead of
+                    # silently overwriting and losing it.
+                    _stale = open_by_id.pop(call_id)
+                    if _stale.get("end_ts", 0) <= 0:
+                        _stale["end_ts"] = _stale["start_ts"] + 1.0
+                        _stale["_end_missing"] = True
+                    _stale.setdefault("parent_call_id", None)
+                    records.append(_stale)
+                open_by_id[call_id] = record
+            else:
+                open_calls[key].append(record)
 
-        elif kind.endswith("_end") and open_calls[key]:
-            # Match by call_id when the runtime emitted it on the end event
-            # (avoids wrong pairing for nested same-type calls, e.g. a tool
-            # wrapping sub-tool-calls that all share the same key).
-            # Fallback: FIFO (older traces that omit call_id on _end events).
+        elif kind.endswith("_end"):
+            # Pair by the shared call_id the runtime assigned to both this
+            # event and its _start — never by comparing agent/type/name or
+            # timestamps. Only a trace old enough to omit call_id entirely
+            # falls back to the legacy per-key FIFO bucket below.
             _end_cid = ev.get("call_id")
             record = None
-            if _end_cid:
-                for _ix, _r in enumerate(open_calls[key]):
-                    if _r.get("call_id") == _end_cid:
-                        record = open_calls[key].pop(_ix)
-                        break
-            if record is None:
+            if _end_cid and _end_cid in open_by_id:
+                record = open_by_id.pop(_end_cid)
+            elif open_calls[key]:
                 record = open_calls[key].pop(0)
+            if record is None:
+                continue
             record["end_ts"] = float(ev.get("timestamp") or 0)
             _ex_status = ev.get("status") or "success"
             if _ex_status not in ("success", "ok", ""):
@@ -285,7 +313,7 @@ def _build_call_records(events: list[dict]) -> list[dict]:
             records.append(record)
 
     # Close any records whose _end event was missing.
-    for pending_list in open_calls.values():
+    for pending_list in list(open_calls.values()) + [list(open_by_id.values())]:
         for rec in pending_list:
             if rec.get("end_ts", 0) <= 0:
                 rec["end_ts"] = rec["start_ts"] + 1.0
@@ -294,105 +322,51 @@ def _build_call_records(events: list[dict]) -> list[dict]:
             rec.setdefault("parent_call_id", None)
         records.extend(pending_list)
 
-    # Drop orphaned engine-op duplicates.  The native layer can emit an engine op
-    # (tool/memory/rag) twice under different correlation ids; when only one gets
-    # an ``*_end`` event, the other is left ``_end_missing`` and — lacking a real
-    # end — balloons across the whole execution during boundary alignment,
-    # overlapping the twin that actually completed (two ``lookup_schedule`` bars,
-    # one instant and one multi-second).  When an ``_end_missing`` engine-io
-    # record has a completed twin (same agent + tool, start within tolerance) it
-    # is a real parallel call whose end the trace omitted.
-    _ENGINE_IO_CT = {"ToolCall", "MemoryCall", "RAGQuery"}
-    _completed_io = [
-        r for r in records
-        if r.get("call_type") in _ENGINE_IO_CT and not r.get("_end_missing")
-    ]
-    if _completed_io:
-        # A model can fire the *same* tool twice in parallel (one assistant
-        # message, two tool_calls → two results).  The native layer sometimes
-        # emits the second call's start but not its *_end, leaving it
-        # ``_end_missing`` so boundary alignment balloons it across the whole
-        # execution.  These are real parallel calls (distinct call ids), NOT
-        # duplicates — keep them: give each the completed twin's end so it renders
-        # as its own bar, and re-home any children (a follow-up LLM that inherited
-        # the orphan as parent) onto the orphan's parent so they are not nested
-        # under a tool.
-        _twin_end: dict = {}
-        _orphan_parent: dict = {}
-        for r in records:
-            if r.get("_end_missing") and r.get("call_type") in _ENGINE_IO_CT:
-                twin = next(
-                    (c for c in _completed_io
-                     if c is not r
-                     and c.get("agent_id") == r.get("agent_id")
-                     and c.get("tool_name") == r.get("tool_name")
-                     and abs(c["start_ts"] - r["start_ts"]) <= _TS_TOL),
-                    None,
-                )
-                if twin is not None:
-                    _twin_end[r["call_id"]] = twin["end_ts"]
-                    _orphan_parent[r["call_id"]] = r.get("parent_call_id")
-        if _twin_end:
-            for r in records:
-                if r["call_id"] in _twin_end:
-                    r["end_ts"] = _twin_end[r["call_id"]]
-                    r.pop("_end_missing", None)
-                _p = r.get("parent_call_id")
-                while _p in _orphan_parent:
-                    _p = _orphan_parent[_p]
-                if _p != r.get("parent_call_id"):
-                    r["parent_call_id"] = _p
+    # NOTE: engine-op "twin matching" used to live here — reconstructing which
+    # of two same-agent/same-tool calls an ``_end_missing`` record actually
+    # belonged to by comparing tool_name + start_ts within ``_TS_TOL``. That
+    # heuristic existed only because the runtime never emitted
+    # tool_call_end/memory_call_end for ANY call (a dead-code bug in
+    # obs_envelope.py's OBSERVABILITY_POST_EXECUTE handling — see
+    # runtime/src/mas/runtime/machines/obs_envelope.py and
+    # runtime/src/mas/runtime/kernel/ingress_step.py's op misclassification
+    # for MEMORY_OP). Now that both are fixed, every engine-op call gets its
+    # own real end event with the SAME call_id its own start used — verified
+    # by instrumenting this exact matching logic against all 4 golden
+    # fixtures (lifecycle-control, extensions, design-space, lab-smoke) and
+    # confirming it never fires. ``_end_missing`` can now only mean a call
+    # that was genuinely still open when the trace was cut (handled below by
+    # the t_final/+1.0s fallback), not a duplicate to reconcile.
 
-    # Re-parent "impossible" children whose start_ts is at/after their parent's
-    # real end_ts.  A call that begins after its parent already returned cannot
-    # truly be nested under it — it is a sibling.  This happens when the runtime
-    # observability call-stack does not pop a completed engine-op frame (e.g. a
-    # tool call) before the next op fires, so a follow-up LLM inherits the tool
-    # as its parent.  Left uncorrected, _align_record_boundaries stretches the
-    # parent to contain the mis-attached child, which overlaps the real sibling
-    # and drops its bar from the render.  Walking up to the grandparent is safe
-    # for genuine delegation: there the sub-agent starts *during* the wrapping
-    # tool (start < parent.end), so it is never reparented.
-    _rp_by_id = {r["call_id"]: r for r in records}
-    for r in records:
-        _pid = r.get("parent_call_id")
-        _parent = _rp_by_id.get(_pid) if _pid else None
-        while (
-            _parent is not None
-            and _parent is not r
-            and _parent.get("end_ts", 0) > 0
-            and not _parent.get("_end_missing")
-            and r["start_ts"] >= _parent["end_ts"] - _TS_TOL
-        ):
-            _pid = _parent.get("parent_call_id")
-            r["parent_call_id"] = _pid
-            _parent = _rp_by_id.get(_pid) if _pid else None
+    # NOTE: a timestamp-based "impossible children" reparenting pass used to
+    # live here — walking a record's parent_call_id chain and promoting it to
+    # its grandparent whenever start_ts landed at/after the parent's own
+    # end_ts (within _TS_TOL). Removed outright: parent_call_id is a real,
+    # runtime-assigned fact (see _build_call_tree), never something a
+    # timestamp comparison gets to override — timestamps are for display/
+    # ordering only. The apparent "impossible" cases this used to "fix" were
+    # never a wrong parent link; they were an artifact of a timestamp-
+    # fabrication bug in library-standard's native export layer
+    # (dispatch_boundary re-stamping every boundary event with the async
+    # export-time `time.time()` instead of the real occurrence-time
+    # TransitionEvent.timestamp — see project.py's boundary_dict_from_transition
+    # and boundary_handlers.py's dispatch_boundary), which made an agent's own
+    # tool_call_end appear to land after its own execution_end even though it
+    # truly happened first. That bug is fixed at its real source; reparenting
+    # based on the (now-correct) timestamps would still have been the wrong
+    # mechanism even when it happened to look right.
 
-    # Link delegated sub-agent executions under the tool call that spawned them
-    # so the Agent lane interleaves them sequentially (moderator → schedule_agent
-    # → moderator …).  A delegation runs the peer's turn inside the delegating
-    # agent's tool call (``delegate_to_<id>`` / ``contract_call``); the peer
-    # emits its own execution record but, arriving through the peer bus, parents
-    # to the MAS call.  Re-link structurally: a peer execution (different agent)
-    # whose whole span is contained within a ToolCall of another agent is that
-    # tool's delegated child.  This is unambiguous — a foreign agent running
-    # inside another agent's tool window is a delegation — and needs no tool-name
-    # heuristic.  _make_agent_sequence then splits the delegator into fragments.
-    _agent_execs = [r for r in records if r.get("level") == "agent"]
-    _tool_calls = [r for r in records if r.get("call_type") == "ToolCall"]
-    for _peer in _agent_execs:
-        _best = None
-        for _tool in _tool_calls:
-            if _tool.get("agent_id") == _peer.get("agent_id"):
-                continue  # a tool cannot delegate to its own agent
-            if (_peer["start_ts"] >= _tool["start_ts"] - _TS_TOL
-                    and _peer["end_ts"] <= _tool["end_ts"] + _TS_TOL):
-                # Tightest containing tool wins (handles nested delegations).
-                if _best is None or (_tool["end_ts"] - _tool["start_ts"]) < (
-                        _best["end_ts"] - _best["start_ts"]):
-                    _best = _tool
-        if _best is not None:
-            _peer["parent_call_id"] = _best["call_id"]
+    # NOTE: delegated sub-agent executions no longer need to be re-linked
+    # here. The runtime now threads a real `caller_call_id` through the
+    # delegation contract itself (InvokeEngineIo.call_id -> execute_engine_tool
+    # -> DelegationContract -> RunTurnFn, resolved once by the driver via
+    # ObservabilityOperator.call_id_for right before the engine is invoked —
+    # see runtime/src/mas/runtime/driver/driver.py), so a peer's own
+    # execution_start.parent_call_id already IS the delegating tool call's
+    # own call_id on the wire, for every delegation depth (including nested
+    # ones — see ctl/.../mas_session.py's wire_peer_delegation). No
+    # timestamp-proximity or tool-name reconstruction needed: _build_call_tree
+    # already builds the correct tree from parent_call_id alone.
 
     # Fix synthetic end_ts for governance-orphaned LLMCalls.
     # When governance fires between two llm_call_start events, the first call
@@ -434,14 +408,36 @@ def _build_call_records(events: list[dict]) -> list[dict]:
             rec["end_ts"] = _t_final
 
     # Multiple agents may share the same runtime call_id (e.g. u1-exec); ensure
-    # agent-lane records remain uniquely addressable in the call tree.
+    # agent-lane records remain uniquely addressable in the call tree. A single
+    # agent delegated to repeatedly (e.g. schedule_agent 3+ times in one turn)
+    # reuses that same runtime id every time, so a one-shot "-{agent_id}"
+    # suffix isn't enough — the 2nd, 3rd, ... collision would all rename to
+    # the identical suffixed id and collide again. Keep suffixing with an
+    # incrementing counter until the result is actually unseen: every branch
+    # needs its own real, addressable call_id (see tree.py's fork/branch
+    # detection, which identifies a branch by its own child call_id).
+    # Renaming only relabels the AgentCall record itself — every LLMCall /
+    # ToolCall the repeated invocation makes still carries the *original*
+    # (reused) id as its own ``parent_call_id`` on the wire, because the
+    # runtime has no notion of the suffix minted here. Remember that original
+    # id as ``_reused_call_id`` so tree.py can still find this invocation's
+    # real children: they live in ``children_of[cid]`` (the shared pool for
+    # every invocation of this agent), not ``children_of[_new_id]`` (which is
+    # empty for every invocation but the first).
     _seen_ids: set[str] = set()
     for rec in records:
         cid = str(rec.get("call_id") or "")
         if not cid:
             continue
         if cid in _seen_ids and rec.get("level") == "agent":
-            rec["call_id"] = f"{cid}-{rec.get('agent_id', 'agent')}"
+            _base = f"{cid}-{rec.get('agent_id', 'agent')}"
+            _new_id = _base
+            _n = 2
+            while _new_id in _seen_ids:
+                _new_id = f"{_base}-{_n}"
+                _n += 1
+            rec["_reused_call_id"] = cid
+            rec["call_id"] = _new_id
         _seen_ids.add(str(rec["call_id"]))
 
     records.extend(_synthesize_context_processing_records(events, records))

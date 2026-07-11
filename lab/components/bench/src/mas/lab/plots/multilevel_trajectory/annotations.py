@@ -47,13 +47,23 @@ _ANNOTATION_KINDS: frozenset[str] = frozenset({
 })
 
 _ANNOTATION_LABEL: dict[str, str] = {
-    "routing":                   "→ routing",
-    "routing_result":            "→ routed",
-    "context_assembled":         "ctx",
-    "state_update_start":        "state↑",
-    "state_update_end":          "state↓",
-    "agent_communication_start": "agent-remote↑",
-    "agent_communication_end":   "agent-remote↓",
+    "routing":                        "→ routing",
+    "routing_result":                 "→ routed",
+    "context_assembled":              "ctx",
+    "state_update_start":             "state↑",
+    "state_update_end":               "state↓",
+    "agent_communication_start":      "agent-remote↑",
+    "agent_communication_end":        "agent-remote↓",
+    # Governance: shown as ⛨ prefix/suffix on the enclosing call hover — not
+    # rendered as a separate bar so the calls lane stays clean.
+    "governance_authorize_start":     "⛨ gov-auth start",
+    "governance_authorize_end":       "⛨ gov-auth end",
+    "governance_validate_start":      "⛨ gov-val start",
+    "governance_validate_end":        "⛨ gov-val end",
+    "obs_wrap_gov_authorize_start":   "⛨ gov-auth",
+    "obs_wrap_gov_authorize_end":     "⛨ gov-auth ✓",
+    "obs_wrap_gov_validate_start":    "⛨ gov-val",
+    "obs_wrap_gov_validate_end":      "⛨ gov-val ✓",
 }
 
 
@@ -63,31 +73,38 @@ def _collect_annotations(
 ) -> dict[str, list[str]]:
     """Return ``call_id \u2192 [annotation_summary_line, ...]`` for L2/L3 XAI hover enrichment.
 
-    Annotation events (routing, context_assembled, …) are matched to the
-    *narrowest* enclosing call record by ``agent_id`` + timestamp containment.
-    Events without a matching record are silently skipped.
+    Annotation events are matched to the call record they annotate by a real
+    id, never timestamp containment. Two shapes, both already resolved by the
+    runtime (see ObservabilityOperator._resolve_transition_ids):
+
+    - governance_authorize/validate_*, obs_wrap_gov_*, and context_assembled
+      are recorded AT the call they annotate \u2014 the event's own ``call_id`` IS
+      that call's ``call_id``.
+    - state_update_start/end is a CHILD of the call whose result it records
+      (record_context_mutation's op threading) \u2014 its own ``call_id`` is a
+      distinct, self-paired synthetic id, so the real link is its
+      ``parent_call_id``.
+
+    Events with neither a matching ``call_id`` nor ``parent_call_id`` (e.g.
+    turn/session-scoped state_update, or an annotation kind with no producer
+    at all \u2014 routing/agent_communication today) are silently skipped: there is
+    no real id to attach them to, and none is guessed.
     """
     ann_events = [e for e in events if e.get("kind") in _ANNOTATION_KINDS]
     if not ann_events:
         return {}
 
+    rec_by_id = {r["call_id"]: r for r in records}
     result: dict[str, list[str]] = defaultdict(list)
 
     for ann in ann_events:
-        ann_ts    = float(ann.get("timestamp") or 0)
-        ann_agent = ann.get("agent_id", "")
-        kind      = ann.get("kind", "")
+        kind = ann.get("kind", "")
 
-        best_rec: Optional[dict] = None
-        best_dur  = float("inf")
-        for rec in records:
-            if rec.get("agent_id") != ann_agent:
-                continue
-            s = float(rec.get("start_ts") or 0)
-            e = float(rec.get("end_ts")   or 0)
-            if s <= ann_ts <= e and (e - s) < best_dur:
-                best_dur = e - s
-                best_rec = rec
+        _own_id = ann.get("call_id")
+        best_rec: Optional[dict] = rec_by_id.get(_own_id) if _own_id in rec_by_id else None
+        if best_rec is None:
+            _parent_id = ann.get("parent_call_id")
+            best_rec = rec_by_id.get(_parent_id) if _parent_id else None
 
         if best_rec is None:
             continue
@@ -164,92 +181,28 @@ def _collect_context_provenance(
 ) -> dict[str, list[dict]]:
     """Return ``call_id → [cpr_event, …]`` for L4 context provenance hover enrichment.
 
-    ``context_part_contributed`` events are matched to LLM call records using
-    three strategies in priority order:
-
-    1. **Explicit UUID match**: ``ev.llm_call_id`` directly equals a record's
-       ``call_id`` (best case — runtime emits the UUID).
-
-    2. **Synthetic-ID mapping**: The runtime's inner layer emits
-       ``context_assembled`` events with a synthetic ``call_id`` like "llm-1"
-       at the same timestamp as the outer ``llm_call_start``.  We build a
-       ``synthetic_id → real_uuid`` map from these events so that CPR events
-       with ``llm_call_id="llm-1"`` are redirected to the correct record.
-
-    3. **"Next LLM call" containment**: CPR events fire *during context
-       assembly*, which happens just before the LLM call starts — so their
-       timestamp is slightly earlier than the LLM call's ``start_ts``.
-       We find the nearest LLM record that starts within a short window after
-       the CPR event.  The agent_id filter is relaxed for generic ``"agent"``
-       values (the runtime emits a placeholder when the per-turn agent id is
-       not yet known at context-assembly time).
+    ``context_part_contributed`` events are matched to LLM call records by a
+    direct, real id match on ``llm_call_id`` — the runtime now resolves this
+    to the SAME call_id the LLM call's own llm_call_start/end use (see
+    ObservabilityOperator.record_context_assembled's op="LLM_CALL" threading
+    and _resolve_transition_ids' CONTEXT_ASSEMBLED branch), never a synthetic
+    placeholder needing timestamp-proximity reconstruction.
     """
     cpr_events = [e for e in events if e.get("kind") == "context_part_contributed"]
     if not cpr_events:
         return {}
 
-    llm_records = [r for r in records if r.get("call_type") == "LLMCall"]
-
-    # --- Strategy 2: build synthetic→real mapping from context_assembled ----
-    # context_assembled inner events carry call_id="llm-N" (synthetic) at
-    # roughly the same timestamp as the matching outer llm_call_start (UUID).
-    synth_to_real: dict[str, str] = {}
-    ca_events = [e for e in events if e.get("kind") == "context_assembled" and e.get("llm_call_id")]
-    for ca in ca_events:
-        synth_id = str(ca["llm_call_id"])
-        if not synth_id:
-            continue
-        ca_ts = float(ca.get("timestamp") or 0)
-        # Find the closest LLM record by start timestamp (50 ms tolerance).
-        best = min(
-            llm_records,
-            key=lambda r: abs(r["start_ts"] - ca_ts),
-            default=None,
-        )
-        if best is not None and abs(best["start_ts"] - ca_ts) <= 0.05:
-            synth_to_real[synth_id] = best["call_id"]
+    llm_records_by_id = {
+        r["call_id"]: r for r in records if r.get("call_type") == "LLMCall"
+    }
 
     result: dict[str, list[dict]] = defaultdict(list)
 
     for ev in cpr_events:
         raw_cid = ev.get("llm_call_id") or ""
-
-        # Strategy 1: direct UUID match
-        if raw_cid:
-            matched = next((r for r in llm_records if r["call_id"] == raw_cid), None)
-            if matched:
-                result[matched["call_id"]].append(ev)
-                continue
-
-        # Strategy 2: synthetic-ID → real UUID
-        if raw_cid and raw_cid in synth_to_real:
-            result[synth_to_real[raw_cid]].append(ev)
-            continue
-
-        # Strategy 3: nearest LLM call that starts *after* this CPR event.
-        # Context assembly fires just before the LLM call that will consume it.
-        # Use a generous look-ahead window (500 ms) and relax the agent_id
-        # filter when agent_id is the generic placeholder "agent".
-        ev_ts    = float(ev.get("timestamp") or 0)
-        ev_agent = ev.get("agent_id", "")
-        _generic_agent = ev_agent in ("", "agent")
-
-        best_rec: Optional[dict] = None
-        best_gap  = float("inf")
-        for rec in llm_records:
-            if not _generic_agent and rec.get("agent_id") != ev_agent:
-                continue
-            gap = rec["start_ts"] - ev_ts
-            # Accept records whose start is within [−_TS_TOL, +0.5s] of the
-            # CPR event: negative gap (CPR fires slightly after start) is
-            # possible when the runtime emits context_part_contributed events
-            # during the first few ms of the LLM call window.
-            if -_TS_TOL <= gap <= 0.5 and gap < best_gap:
-                best_gap = gap
-                best_rec = rec
-
-        if best_rec:
-            result[best_rec["call_id"]].append(ev)
+        matched = llm_records_by_id.get(raw_cid) if raw_cid else None
+        if matched:
+            result[matched["call_id"]].append(ev)
 
     return dict(result)
 
@@ -267,7 +220,7 @@ def _format_cpr_hover(cpr_parts: list[dict]) -> str:
     total_tokens = 0
     for part in cpr_parts:
         source = part.get("source", "?")
-        mechanism = part.get("access_mechanism", "inject")
+        mechanism = part.get("mechanism", "inject")
         cause_type = part.get("cause_type", "deterministic")
         tokens = part.get("token_estimate", 0)
         retained = part.get("retained", True)
@@ -355,12 +308,18 @@ def _stagger_coinc_processing_calls(seq: list[dict]) -> list[dict]:
                 staggered["end_ts"]   = ts + (idx + 1) * _STAGGER_DUR
                 result.append(staggered)
             # Snap the next record's start_ts forward if it falls inside the
-            # staggered group.  Only advance — never move it backward.
+            # staggered group.  Only advance — never move it backward — and
+            # shift end_ts by the same delta so a real (non-zero) duration is
+            # never corrupted (e.g. shrunk, or inverted into end_ts <
+            # start_ts) — the same rule _reserve_marker_width in tree.py
+            # applies for its own analogous forward-bump.
             _group_end = ts + len(group) * _STAGGER_DUR
             if j < len(seq):
                 nxt_copy = dict(seq[j])
-                if nxt_copy.get("start_ts", _group_end) < _group_end:
+                _delta = _group_end - nxt_copy.get("start_ts", _group_end)
+                if _delta > 0:
                     nxt_copy["start_ts"] = _group_end
+                    nxt_copy["end_ts"] = nxt_copy.get("end_ts", _group_end) + _delta
                 result.append(nxt_copy)
                 i = j + 1
             else:

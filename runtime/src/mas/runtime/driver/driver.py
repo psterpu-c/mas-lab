@@ -283,17 +283,41 @@ class KernelDriver:
                 run_contract_execute_obs,
             )
 
+            # q.pending_tool_name/pending_tool_args are single shared fields that
+            # only ever hold the LAST tool spec set by schedule_parallel_tools_egress's
+            # loop — by the time this per-sym loop runs, every sym would read the
+            # same stale (name, args) unless we look each one up by its own
+            # correlation_id via pending_tools_by_cid (populated per-spec in
+            # parallel_tools.py). Fall back to the shared fields for the
+            # single-tool-call case, where pending_tools_by_cid is never populated.
+            by_cid_obs = q.pending_tools_by_cid.get(sym.correlation_id)
+            obs_tool_name, obs_tool_args = (
+                by_cid_obs if by_cid_obs is not None else (q.pending_tool_name, q.pending_tool_args)
+            )
             env_ctx = EnvelopeContext(
                 q=q,
                 correlation_id=sym.correlation_id,
                 contract=contract_kind_for_op(sym.op),
                 scheduled_op=sym.op,
                 observability=get_bound_observability() or self.observability,
-                tool_name=q.pending_tool_name,
-                tool_arguments=dict(q.pending_tool_args or {}),
+                tool_name=obs_tool_name,
+                tool_arguments=dict(obs_tool_args or {}),
                 destructive=sym.destructive,
             )
             run_contract_execute_obs(env_ctx)
+            # Attach this op's own resolved call_id to the invocation itself
+            # (see InvokeEngineIo.call_id's docstring) — the observability
+            # boundary has, by the CONTRACT_EXECUTE step just above, already
+            # assigned this (correlation_id, op) pair its stable call_id.
+            # Reading it back here means the engine (and, transitively, a
+            # delegate_to_* tool call) always has its own real identity to
+            # forward as the callee's caller_call_id — a real contract
+            # field, not a closure-captured lookup done later by whichever
+            # session-orchestration code happens to dispatch the delegate.
+            if env_ctx.observability is not None:
+                own_call_id = env_ctx.observability.call_id_for(sym.correlation_id, sym.op)
+                if own_call_id:
+                    sym = sym.model_copy(update={"call_id": own_call_id})
             if pool is not None:
                 pool.submit(sym)
             else:
@@ -330,15 +354,14 @@ class KernelDriver:
         if not isinstance(ret, EngineIoReturn):
             return
         self._record_working_memory(io, ret)
-        if io.op == "LLM_CALL":
-            from mas.runtime.boundary.context.telemetry import record_engine_llm_return
-
-            record_engine_llm_return(
-                getattr(self.ctx, "observability", None) if self.ctx else None,
-                correlation_id=ret.correlation_id,
-                text=ret.text or "",
-                next_step=ret.next_step,
-            )
+        # The observability end-event (ENGINE_IO_RETURN) for every op — LLM,
+        # tool, and memory alike — is now recorded uniformly by
+        # ObsEnvelopeMachine.step() on OBSERVABILITY_POST_EXECUTE (see
+        # obs_envelope.py), driven by the kernel's own ingress processing of
+        # this same return. A hand-written LLM-only call used to live here;
+        # keeping it would double-record llm_call_end now that the envelope
+        # machine's path actually runs for every op instead of being
+        # permanently shadowed.
         detail = f"correlation_id={ret.correlation_id} response_kind={ret.response_kind}"
         ts_mono, ts_wall = _exchange_timestamp()
         engine_raw = _engine_payload_json(ret) if self.capture_engine_io else ""
@@ -404,6 +427,7 @@ class KernelDriver:
                     content=f"tool_call:{ret.tool_name or 'tool'}",
                     wm_count=len(store.messages),
                     committed_count=len(getattr(ctx, "committed_messages", []) or []),
+                    op="LLM_CALL",
                 )
         elif io.op == "LLM_CALL" and ret.next_step == "STOP" and ret.text:
             store.record_assistant_message(ret.text)
@@ -465,6 +489,7 @@ class KernelDriver:
             content=text,
             wm_count=len(store.messages),
             committed_count=len(getattr(ctx, "committed_messages", []) or []),
+            op="TOOL_CALL",
         )
 
     def _record_parallel_tool_calls(self, ios: list[InvokeEngineIo], q: Any) -> None:

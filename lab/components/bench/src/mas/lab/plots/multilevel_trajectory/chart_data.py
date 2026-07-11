@@ -32,16 +32,26 @@ def _build_chart_data(
     before the DAG is assembled, so every lane uses the exact same timestamp
     set — no heuristic timestamp merging needed here.
     """
-    all_buckets = sorted(state_reg.keys())
+    # DFS virtual-position order — NOT real timestamp order (see tree.py's
+    # _assign_dfs_positions / dag.py's finalization pass). A delegating
+    # agent's 2nd..Nth sibling call keeps its own early dispatch timestamp
+    # even though its subtree isn't explored until DFS reaches it, often well
+    # after an earlier sibling's own subtree has advanced real time past it —
+    # sorting by raw ts would put that later sibling before the earlier
+    # sibling's own conclusion. dfs_pos is what actually reflects DFS order.
+    all_buckets = sorted(state_reg.keys(), key=lambda ts: state_reg[ts].dfs_pos)
     _numbered_buckets2 = [b for b in all_buckets if not state_reg[b].label_override]
     _numbered_seq2     = {b: i + 1 for i, b in enumerate(_numbered_buckets2)}
-    state_num   = {
-        b: _numbered_seq2.get(b, _numbered_seq2.get(
-            max((nb for nb in _numbered_buckets2 if nb < b), default=_numbered_buckets2[0])
-            if _numbered_buckets2 else b, 1
-        ))
-        for b in all_buckets
-    }
+    # A label-overridden bucket (thinking sub-state, connector-only, …) has no
+    # number of its own — it inherits whichever numbered bucket precedes it.
+    # "Precedes" means in all_buckets' own order (DFS position), not by raw
+    # ts value — those can now differ (see all_buckets' own comment above).
+    state_num: dict[float, int] = {}
+    _last_numbered = 1
+    for _b in all_buckets:
+        if _b in _numbered_seq2:
+            _last_numbered = _numbered_seq2[_b]
+        state_num[_b] = _last_numbered
 
     bucket_to_lanes: dict[float, list[int]] = defaultdict(list)
     for li, lane in enumerate(lanes):
@@ -124,6 +134,10 @@ def _build_chart_data(
                         "cprData": el.cpr_data,
                         "model":   el.model,
                     } if el.cpr_data else {}),
+                    **({
+                        "governance": el.governance,
+                        "governanceColor": el.governance_color,
+                    } if el.governance else {}),
                 })
             elif isinstance(el, TransNode):
                 _td: dict[str, Any] = {
@@ -146,6 +160,12 @@ def _build_chart_data(
                     _td["parallelGroupId"] = el.parallel_group_id
                     _td["parallelRank"]    = el.parallel_rank
                     _td["parallelSize"]    = el.parallel_size
+                if el.governance:
+                    _td["governance"] = el.governance
+                    _td["governanceColor"] = el.governance_color
+                if el.retry_group_id:
+                    _td["retryGroupId"] = el.retry_group_id
+                    _td["retryAttempt"] = el.retry_attempt
                 seq.append(_td)
         _lane_d: dict[str, Any] = {
             "laneId":   lane.lane_id,
@@ -159,10 +179,38 @@ def _build_chart_data(
 
     t_min_chart = all_buckets[0]  if all_buckets else 0.0
     t_max_chart = all_buckets[-1] if all_buckets else 0.0
+
+    # Per-gap classification driving the JS x-axis (computeBaseXPos/applyZoom/
+    # computeMinZoom): one entry per adjacent pair in all_buckets (already
+    # DFS-ordered). "reset" gaps (a branch boundary — see dag.py's finalization
+    # pass) and "instant" gaps (a near-zero-duration call, e.g. a delegation
+    # dispatch marker) both get a small fixed column width, never
+    # time-proportional and never scaled by zoom; everything else is "normal".
+    _instant_pairs: set[tuple[float, float]] = {
+        (el.start_ts, el.end_ts)
+        for lane in lanes
+        for el in lane.sequence
+        if isinstance(el, TransNode) and el.is_instant and el.call_type != "ProcessingCall"
+    }
+    bucket_gaps = []
+    for _i in range(1, len(all_buckets)):
+        _prev_ts, _ts = all_buckets[_i - 1], all_buckets[_i]
+        _gap: dict[str, Any] = {}
+        if state_reg[_ts].is_branch_reset:
+            _gap["kind"] = "reset"
+            if state_reg[_ts].branch_id:
+                _gap["branchId"] = state_reg[_ts].branch_id
+        elif (_prev_ts, _ts) in _instant_pairs:
+            _gap["kind"] = "instant"
+        else:
+            _gap["kind"] = "normal"
+        bucket_gaps.append(_gap)
+
     return {
         "title":            title,
         "widthMode":        width_mode,
         "buckets":          all_buckets,
+        "bucketGaps":       bucket_gaps,
         "sharedBuckets":    shared_buckets,
         "lanes":            lanes_json,
         "showUserActors":   show_user_actors,
@@ -209,8 +257,15 @@ def build_trajectory_chart_data(
     show_time_axis: bool = True,
     show_provenance: bool = True,
     annotations: dict | None = None,
+    enabled_facets: "set[str] | None" = None,
 ) -> dict:
     """Build the chart data dict for the D3 multilevel renderer.
+
+    ``enabled_facets`` toggles the optional annotation layers (cpr,
+    governance, annotations, thinking — see dag.py's ``_ALL_FACETS``)
+    overlaid on top of the core call-tree structure; ``None`` (default)
+    enables all of them. ``show_provenance=False`` is sugar for excluding
+    ``"cpr"`` alone — kept for backward compatibility.
 
     This is the **data-preparation stage** of the pipeline — equivalent to
     the server side when the UI path is used.  The browser renders the chart
@@ -250,7 +305,9 @@ def build_trajectory_chart_data(
     records = _build_call_records(trace)
     if not records:
         return {}
-    state_reg, lanes = _build_dag(records, trace, show_provenance=show_provenance)
+    state_reg, lanes = _build_dag(
+        records, trace, show_provenance=show_provenance, enabled_facets=enabled_facets
+    )
     if not lanes:
         return {}
     return _build_chart_data(
@@ -272,6 +329,7 @@ def build_trajectory_chart_data_from_kg(
     show_user_actors: bool = True,
     show_time_axis: bool = True,
     show_provenance: bool = True,
+    enabled_facets: "set[str] | None" = None,
 ) -> dict:
     """KG-backed variant of :func:`build_trajectory_chart_data`.
 
@@ -299,7 +357,9 @@ def build_trajectory_chart_data_from_kg(
     records, events = src.load(q)
     if not records:
         return {}
-    state_reg, lanes = _build_dag(records, events, show_provenance=show_provenance)
+    state_reg, lanes = _build_dag(
+        records, events, show_provenance=show_provenance, enabled_facets=enabled_facets
+    )
     if not lanes:
         return {}
     return _build_chart_data(

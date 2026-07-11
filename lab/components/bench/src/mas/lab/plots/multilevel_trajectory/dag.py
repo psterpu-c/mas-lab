@@ -22,6 +22,14 @@ from mas.lab.plots.multilevel_trajectory.constants import (
     _TS_TOL,
     TYPE_LABEL,
 )
+from mas.lab.plots.multilevel_trajectory.governance import (
+    _collect_blocked_actions,
+    _collect_governance_decisions,
+    _collect_hitl_exchanges,
+    _collect_retry_chains,
+    _governance_severity,
+    notable_governance,
+)
 from mas.lab.plots.multilevel_trajectory.models import LaneDef, StateNode, TransNode
 from mas.lab.plots.multilevel_trajectory.records import (
     _extract_final_output,
@@ -30,17 +38,33 @@ from mas.lab.plots.multilevel_trajectory.records import (
 )
 from mas.lab.plots.multilevel_trajectory.tree import (
     _align_record_boundaries,
+    _assign_dfs_positions,
     _build_call_tree,
+    _detect_delegation_forks,
     _make_agent_sequence,
     _make_call_sequence,
+    _reset_branch_agent_call_ids,
 )
+
+#: Every optional annotation layer _build_dag can attach on top of the core
+#: call-tree structure. Each is a pure function over (events, records) — see
+#: governance.py's module docstring — so disabling one just skips computing
+#: and attaching that data; nothing else in the DAG depends on it.
+_ALL_FACETS = frozenset({"cpr", "governance", "annotations", "thinking"})
+
 
 def _build_dag(
     records: list[dict],
     events:  list[dict],
     show_provenance: bool = True,
+    enabled_facets: "set[str] | None" = None,
 ) -> tuple[dict[float, StateNode], list[LaneDef]]:
     """Assemble the DAG from the call tree.
+
+    ``enabled_facets`` toggles the optional annotation layers overlaid on the
+    core structural DAG (``_ALL_FACETS``); ``None`` (default) enables all of
+    them. ``show_provenance=False`` is sugar for excluding ``"cpr"`` — kept
+    for backward compatibility with existing callers.
 
     Returns
     -------
@@ -54,6 +78,9 @@ def _build_dag(
     States at the same ``ts`` in different lanes are the same object
     (shared reference), which the renderer uses to draw multi-lane connectors.
     """
+    facets = set(enabled_facets) if enabled_facets is not None else set(_ALL_FACETS)
+    if not show_provenance:
+        facets.discard("cpr")
     all_ts = [float(e.get("timestamp") or 0) for e in events if e.get("timestamp")]
     # Use record start/end times as the authoritative bounds — they include
     # synthetic end_ts (+1 s) for calls whose *_end event was missing,
@@ -72,12 +99,25 @@ def _build_dag(
     hover_pri: dict[float, int]       = {}
 
     # L2/L3 XAI annotation map: call_id → list of short summary strings
-    ann_map: dict[str, list[str]] = _collect_annotations(events, records)
+    ann_map: dict[str, list[str]] = (
+        _collect_annotations(events, records) if "annotations" in facets else {}
+    )
 
     # L4 context provenance: context_part_contributed → per-call_id summary
     cpr_map: dict[str, list[dict]] = (
-        _collect_context_provenance(events, records) if show_provenance else {}
+        _collect_context_provenance(events, records) if "cpr" in facets else {}
     )
+
+    # Governance facet: decisions, HITL Q&A, blocked-action ghosts, retries.
+    # See governance.py's module docstring for why this operates on the same
+    # (events, records) pair the KG adapter already produces.
+    if "governance" in facets:
+        gov_map:    dict[str, list[dict]] = _collect_governance_decisions(events, records)
+        hitl_map:   dict = _collect_hitl_exchanges(events)
+        blocked:    list[dict] = _collect_blocked_actions(events, records)
+        retry_map:  dict[str, dict] = _collect_retry_chains(events, records)
+    else:
+        gov_map, hitl_map, blocked, retry_map = {}, {}, [], {}
 
     def state(ts: float, hover: str = "", level: str = "") -> StateNode:
         """Fetch or create the StateNode at *ts* (exact timestamp key).
@@ -108,15 +148,121 @@ def _build_dag(
     mas_records    = sorted([r for r in records if r["level"] == "mas"],
                             key=lambda r: r["start_ts"])
     agent_sequence = _make_agent_sequence(records, children_of, parent_of)
-    call_sequence  = _stagger_coinc_processing_calls(
-        _make_call_sequence(agent_sequence, children_of)
+
+    # Fork/Branch detection (tree-structural — see _detect_delegation_forks):
+    # computed before _make_call_sequence so it can tag each fork's 2nd..Nth
+    # sibling's own first call as a branch entry (see
+    # _reset_branch_agent_call_ids / _make_call_sequence's docstring).
+    fork_groups = _detect_delegation_forks(records, parent_of, rec_by_id)
+    _reset_branch_ids = _reset_branch_agent_call_ids(fork_groups)
+    call_sequence = _stagger_coinc_processing_calls(
+        _make_call_sequence(agent_sequence, children_of, _reset_branch_ids)
     )
+
+    # DFS virtual-position axis: call_sequence is already DFS-ordered (no
+    # wall-clock sort) and already tagged, so walking it once assigns every
+    # boundary timestamp a monotonic position, with a fixed-tick reset
+    # (instead of the real, often-negative gap) at each branch entry.
+    _ts_to_dfs_pos, _reset_branch_id = _assign_dfs_positions(call_sequence)
+
+    # Extend the DFS axis to each fork branch's OWN raw start_ts too — the
+    # Agents lane's true fragment boundary (see _make_agent_sequence) is NOT
+    # the same timestamp as the branch's first call-level record tagged
+    # _branch_entry in call_sequence (_reserve_marker_width pushes that one
+    # later to clear the delegating marker cluster). _assign_dfs_positions
+    # above only covers call_sequence's own timestamps, so without this the
+    # generic real-time interpolation fallback below (which assumes nearby
+    # timestamps are nearby in DFS order — false for a fork's 2nd..Nth
+    # sibling, dispatched long before DFS reaches its subtree) would place
+    # this raw boundary in the middle of an already-passed DFS range instead
+    # of just before the branch's own tagged entry. Every rank>0 fork member
+    # gets its raw start_ts pinned to a hair before its own _branch_entry
+    # position — both the Agents lane (_bridge_to_state, below) and the Calls
+    # lane's own "inject agent-boundary timestamps" pass rely on this.
+    _reset_ts_by_branch_id: dict[str, float] = {
+        _bid: _ts for _ts, _bid in _reset_branch_id.items()
+    }
+    for _members in fork_groups.values():
+        for _member in _members[1:]:
+            _raw_ts   = _member["start_ts"]
+            _entry_ts = _reset_ts_by_branch_id.get(_member["call_id"])
+            if _entry_ts is not None and _raw_ts not in _ts_to_dfs_pos:
+                _ts_to_dfs_pos[_raw_ts] = _ts_to_dfs_pos[_entry_ts] - 1e-3
 
     seq_ctr = [0]
 
     def next_seq() -> int:
         seq_ctr[0] += 1
         return seq_ctr[0]
+
+    def _bridge_to_state(
+        elems: list, target_ts: float, hover: str = "", level: str = "agent",
+    ) -> StateNode:
+        """Ensure *elems* (a lane's in-progress sequence) reaches *target_ts*
+        as its own bracketing StateNode, inserting a zero-content connector
+        TransNode first when the lane doesn't already end there.
+
+        Needed wherever DFS order jumps — forward or backward in real time —
+        without a real call of its own to anchor the reset boundary to (see
+        the Agents lane's rank>0 fork-branch handling below): the strict
+        State/Trans alternation ``_trajectory_validator.py`` enforces means a
+        StateNode can never simply be appended next to another StateNode, no
+        matter how the timestamps compare. The Calls lane doesn't need this —
+        every branch already has a real call record to tag as `_branch_entry`
+        (see tree.py) — but the Agents lane has no such record to synthesize
+        one from, so a plain connector plays that role instead.
+        """
+        prev = elems[-1]
+        node = state(target_ts, hover, level)
+        if node is prev:
+            return node
+        # Guard against a DFS-position regression: target_ts may already be
+        # registered from an EARLIER-in-DFS-order fragment that happened to
+        # land on this exact real timestamp by coincidence — e.g. a fork's
+        # rank-0 branch's own end, when a LATER sibling's merge-computed
+        # "delegating agent resumes after every branch joins" boundary
+        # (_make_agent_sequence) lands on that same wall-clock instant
+        # because that earlier branch happened to be the last one to finish
+        # in real time even though DFS visited it first. Reusing that node's
+        # dfs_pos here would walk this lane backward. Mint a fresh, distinct
+        # real ts a hair after prev's own instead of touching the pre-existing
+        # node — other lanes may still reference it correctly — the same
+        # technique tree.py's _MARKER_DUR/_reserve_marker_width already use
+        # elsewhere to keep genuinely-different moments from colliding on one
+        # timestamp.
+        #
+        # NOTE: this only catches the case where target_ts is ALREADY
+        # registered in _ts_to_dfs_pos with a stale value at the time this
+        # runs. A fork whose branches complete in a different order than DFS
+        # visited them can still leave the delegating agent's own tail
+        # fragment (resuming after every branch joins) with an imperfect
+        # position when target_ts isn't covered yet either — the generic
+        # real-time interpolation fallback (dag.py's later pass) has no DFS
+        # awareness. That narrower case is not fully solved here; see
+        # test_multilevel_plot_dfs_axis.py's module docstring for the
+        # regression coverage this fix does guarantee.
+        _existing_pos = _ts_to_dfs_pos.get(target_ts)
+        _prev_pos      = _ts_to_dfs_pos.get(prev.ts, 0.0)
+        if _existing_pos is not None and _existing_pos < _prev_pos:
+            _fresh_ts = prev.ts + 1e-3
+            while _fresh_ts in state_reg:
+                _fresh_ts += 1e-3
+            node = state(_fresh_ts, hover, level)
+            _ts_to_dfs_pos[_fresh_ts] = _prev_pos + 1e-3
+            target_ts = _fresh_ts
+        elems.append(TransNode(
+            node_id=f"tr-bridge-{next_seq()}",
+            call_type="BranchLink",
+            label="",
+            start_ts=prev.ts,
+            end_ts=target_ts,
+            level=level,
+            agent_id="",
+            seq=next_seq(),
+            is_instant=True,
+        ))
+        elems.append(node)
+        return node
 
     def _provenance_block(rec: dict, ct: str) -> str:
         """Build a provenance triplet block for hover enrichment.
@@ -260,7 +406,7 @@ def _build_dag(
             _cpr_structured = []
             for _p in _cpr_raw:
                 _psrc = _p.get("source", "?")
-                _pmech = _p.get("access_mechanism", "inject")
+                _pmech = _p.get("mechanism", "inject")
                 _entry: dict = {
                     "source": _psrc,
                     "category": _source_category(_psrc, _pmech),
@@ -272,7 +418,7 @@ def _build_dag(
                     "tokens": _p.get("token_estimate", 0),
                     "retained": _p.get("retained", True),
                     "placement": _p.get("placement", ""),
-                    "content": _p.get("content", ""),
+                    "content": _p.get("content") or _p.get("content_preview") or "",
                     "sourceType": _p.get("source_type", ""),
                     "sourceId": _p.get("source_id", ""),
                     "trigger": _p.get("trigger", ""),
@@ -308,6 +454,13 @@ def _build_dag(
             is_instant=(ct not in ("AgentCall", "Session", "MASCall", "ProcessingCall") and abs(e - s) <= _TS_TOL),
             cpr_data=_cpr_structured,
             model=_model,
+            # notable_governance: suppress the badge overlay for plain ALLOW/LOG
+            # (nearly every call has one) — only surface it when a decision
+            # actually changed the outcome. The dedicated Governance lane below
+            # shows every decision unfiltered; this only gates the overlay badge.
+            governance=notable_governance(gov_map.get(_cid, [])),
+            retry_group_id=retry_map.get(_cid, {}).get("groupId", ""),
+            retry_attempt=retry_map.get(_cid, {}).get("attempt", 0),
         )
 
     lanes: list[LaneDef] = []
@@ -334,6 +487,18 @@ def _build_dag(
     ]
     lanes.append(sess_lane)
 
+    def _hitl_between(t0: float, t1: float) -> Optional[dict]:
+        """Find the human's actual question and answer for a gap between two
+        MAS invocations, so the HITL bar shows what was asked and decided
+        instead of an empty box."""
+        for ev in events:
+            if ev.get("kind") != "hitl_request":
+                continue
+            ts = float(ev.get("timestamp") or 0)
+            if t0 - _TS_TOL <= ts <= t1 + _TS_TOL:
+                return hitl_map.get(ev.get("correlation_id"))
+        return None
+
     # ── MAS lane: one transition per MAS invocation, HITL gaps between them ──
     mas_lane = LaneDef("mas", "mas", "MAS")
     if mas_records:
@@ -347,13 +512,25 @@ def _build_dag(
             if i + 1 < len(mas_records):
                 nxt = mas_records[i + 1]
                 hitl_rec: dict = {"input": "", "output": "", "agent_id": ""}
+                _hx = _hitl_between(end_ts, nxt["start_ts"])
+                if _hx:
+                    hitl_rec["input"] = _hx.get("question", "")
+                    _resolution = _hx.get("resolution", "")
+                    _answer = _hx.get("answer", "")
+                    if _resolution or _answer:
+                        hitl_rec["output"] = f"[{_resolution}] {_answer}".strip()
                 elems.append(trans(hitl_rec, lane_level="mas", node_id=f"tr-hitl-{i}",
                                    call_type="HITL", label="HITL",
                                    start_ts=end_ts, end_ts=nxt["start_ts"]))
                 elems.append(state(nxt["start_ts"], "", "mas"))
         if not (isinstance(elems[-1], StateNode)
                 and abs(elems[-1].ts - t_max) <= _TS_TOL):
-            elems.append(state(t_max, s_out, "session"))
+            # A bare append here would leave two consecutive StateNodes with
+            # no Trans between them (t_max can be inflated well past this
+            # lane's last real state by an unrelated lane's synthetic
+            # end-missing placeholder — see records.py's _end_missing
+            # fallback) — bridge it instead, same as the Agent lane below.
+            _bridge_to_state(elems, t_max, s_out, "session")
         mas_lane.sequence = elems
     else:
         empty: dict = {"input": s_in, "output": s_out, "agent_id": ""}
@@ -368,52 +545,20 @@ def _build_dag(
 
     # ── Agent lane: DFS-derived sequence, delegation splits included ─────────
 
-    # Detect parallel agent groups: non-fragment records whose start_ts values
-    # overlap (within _TS_TOL) share the same parallel fork/join span.  We
-    # collect them into groups and assign a stable group id so the JS renderer
-    # can display them side-by-side instead of sequentially.
-    _parallel_info: dict[str, tuple[str, int, int]] = {}  # cid → (group_id, rank, size)
-    _parallel_group_spans: list[dict] = []   # [{startTs, endTs, size}, …] for lane JSON
-    _pg_counter = 0
-    _active_pg: list[dict] = []             # accumulator for the current group
-    _active_pg_end: float  = -1.0
-
-    def _flush_parallel_group() -> None:
-        nonlocal _pg_counter
-        if len(_active_pg) > 1:
-            _pg_counter += 1
-            _gid = f"pg-{_pg_counter}"
-            for _rank, _r in enumerate(_active_pg):
-                _parallel_info[_r["call_id"]] = (_gid, _rank, len(_active_pg))
-            _parallel_group_spans.append({
-                "startTs": min(_r["start_ts"] for _r in _active_pg),
-                "endTs":   max(_r["end_ts"]   for _r in _active_pg),
-                "size":    len(_active_pg),
-            })
-
-    for _arec in agent_sequence:
-        if _arec.get("_fragment"):
-            _flush_parallel_group()
-            _active_pg = []
-            _active_pg_end = -1.0
-            continue
-        if not _active_pg:
-            _active_pg     = [_arec]
-            _active_pg_end = _arec["end_ts"]
-        elif abs(_arec["start_ts"] - _active_pg[0]["start_ts"]) <= _TS_TOL:
-            # Same-time start → parallel branch
-            _active_pg.append(_arec)
-            _active_pg_end = max(_active_pg_end, _arec["end_ts"])
-        else:
-            _flush_parallel_group()
-            _active_pg     = [_arec]
-            _active_pg_end = _arec["end_ts"]
-    _flush_parallel_group()
+    # Fork/Branch groups (see fork_groups above) render sequentially along the
+    # DFS virtual-position axis with a reset separator between them — there
+    # is no side-by-side slot layout for overlapping siblings anymore; every
+    # fork's branches, overlapping or not, are drawn one after another.
+    _parallel_info: dict[str, tuple[str, int, int]] = {}  # agent call_id → (group_id, rank, size)
+    for _fork_parent_id, _members in fork_groups.items():
+        _gid = f"fork-{_fork_parent_id}"
+        for _rank, _r in enumerate(_members):
+            _parallel_info[_r["call_id"]] = (_gid, _rank, len(_members))
 
     if agent_sequence:
         agent_lane = LaneDef("agents", "agent", "Agents")
-        agent_lane.parallel_spans = _parallel_group_spans
         elems = [state(t_min, s_in, "session")]
+        _agent_branch_started: set[str] = set()  # rank>0 call_ids already bridged
         for i, arec in enumerate(agent_sequence):
             short  = arec["agent_id"].split(".")[-1][:18]
             end_ts = arec["end_ts"] if arec.get("end_ts", 0) > 0 else t_max
@@ -421,33 +566,70 @@ def _build_dag(
 
             # Populate the START state of each agent fragment with its input so
             # delegation handoff boundaries show the task being passed in.
-            # We do NOT append st_start: the previous fragment's st_end already
-            # placed this state in the sequence (it's the same StateNode object).
-            # For the first fragment, state(t_min) is pre-appended above.
-            # Exception: for parallel agents with rank > 0, the previous element
-            # in elems is the first branch's join state (at a later ts), so we
-            # MUST explicitly insert the fork state to maintain sequence validity.
-            st_start = state(arec["start_ts"], arec.get("input", ""), "agent")
-            st_start.hover_by_lane["agents"] = arec.get("input", "")
-            if _par:
-                _gid, _rank, _size = _par
-                if _rank == 0:
-                    # Fork state: mark the boundary where parallel branches split.
-                    # For rank 0 the fork state is already the previous iteration's
-                    # st_end — just annotate it; never insert it again.
-                    st_start.is_fork           = True
-                    st_start.parallel_group_id = _gid
-                    st_start.parallel_size     = _size
-                # rank > 0: do NOT insert st_start into elems.
-                # The JS parallel-slot renderer uses TransNode.startTs directly
-                # (via agentParallelSlot) to position the bar — it does not need
-                # a preceding StateNode anchor in the sequence.  Inserting one
-                # for rank > 0 produces two consecutive StateNodes at slightly
-                # different timestamps (the branches may start 1 ms apart),
-                # causing the "S8 → S9" with no transition between them bug.
+            #
+            # In the common case elems[-1] IS already this exact ts — the
+            # previous fragment's st_end placed the same StateNode object
+            # there — so _bridge_to_state's identity check makes this a no-op
+            # (no new element appended). But that assumption can break in more
+            # ways than just "rank > 0's first fragment" (a fork's 2nd..Nth
+            # sibling, whose own subtree hasn't been explored yet — DFS went
+            # back up the call tree and down into a new sibling, often a real
+            # backward jump relative to elapsed time): a fork whose branches
+            # finish in a DIFFERENT order than DFS visited them also leaves
+            # the delegating agent's own tail fragment (resuming after ALL
+            # branches join) starting at a timestamp elems[-1] never reached —
+            # elems[-1] is whichever branch DFS happened to visit last, not
+            # necessarily the one that ended last in real time. Bridging
+            # unconditionally (instead of only for the rank > 0 case) makes
+            # every fragment boundary robust to both, with no cost for the
+            # (overwhelming majority of) fragments where the assumption holds.
+            _target_ts = arec["start_ts"]
+            if _par and _par[1] > 0 and arec["call_id"] not in _agent_branch_started:
+                # rank > 0's first fragment — only the branch's FIRST
+                # agent_sequence fragment needs this; a delegate that itself
+                # further delegates gets split into pre/tail fragments, and
+                # only the pre fragment is the true branch entry (the tail
+                # fragment falls through to the plain arec["start_ts"] above
+                # like any other continuation).
+                #
+                # Bridge to the branch's own _branch_entry timestamp
+                # (_reset_ts_by_branch_id), NOT arec["start_ts"] — the two are
+                # usually only ~1ms apart in principle (the delegate's own
+                # execution starts just after its dispatching tool call, per
+                # _align_record_boundaries), but both are computed from the
+                # SAME "dispatch instant + _MARKER_DUR" arithmetic as a
+                # sibling batch's *other* delegation markers, so
+                # arec["start_ts"] can land exactly on some unrelated
+                # marker's own timestamp — reusing that ts here would
+                # silently steal the marker's already-correct (intentionally
+                # clustered, not reset) dfs_pos instead of getting a reset
+                # position of its own. The branch's own _branch_entry
+                # timestamp has no such collision — it is unique to this
+                # branch by construction — and already has a correct,
+                # monotonic dfs_pos from _assign_dfs_positions.
+                _target_ts = _reset_ts_by_branch_id.get(arec["call_id"], arec["start_ts"])
+                _agent_branch_started.add(arec["call_id"])
 
+            st_start = _bridge_to_state(elems, _target_ts, arec.get("input", ""))
+            if _par and _par[1] == 0:
+                # Fork state: mark the boundary where parallel branches
+                # split. For rank 0 the fork state is (almost always)
+                # already the previous iteration's st_end.
+                _gid, _rank, _size = _par
+                st_start.is_fork           = True
+                st_start.parallel_group_id = _gid
+                st_start.parallel_size     = _size
+            st_start.hover_by_lane["agents"] = arec.get("input", "")
+
+            # st_start.ts is the authoritative start for the real Trans below
+            # too — _bridge_to_state may have minted a fresh ts distinct from
+            # arec["start_ts"] (the branch-entry override above, or the
+            # dfs_pos-regression guard inside _bridge_to_state itself), and
+            # the Trans must agree with its own preceding StateNode so
+            # dfs_pos_start resolves to the same, already-correct position
+            # rather than falling through to a stale or interpolated one.
             _tr = trans(arec, lane_level="agent", node_id=f"tr-agent-{i}",
-                        label=short, end_ts=end_ts)
+                        label=short, start_ts=st_start.ts, end_ts=end_ts)
             if _par:
                 _gid, _rank, _size = _par
                 _tr.parallel_group_id = _gid
@@ -482,7 +664,13 @@ def _build_dag(
             elems.append(st_end)
         if not (isinstance(elems[-1], StateNode)
                 and abs(elems[-1].ts - t_max) <= _TS_TOL):
-            elems.append(state(t_max, s_out, "session"))
+            # The DFS-last agent fragment isn't necessarily the real-time-last
+            # one — e.g. a fork's earlier-ranked sibling can run long past the
+            # point DFS order puts it, so this lane's own final element can
+            # land well before t_max. A bare append here would leave two
+            # consecutive StateNodes with no Trans between them (the same
+            # class of bug rank>0 branches hit above); bridge it instead.
+            _bridge_to_state(elems, t_max, s_out, "session")
         agent_lane.sequence = elems
         lanes.append(agent_lane)
 
@@ -571,6 +759,16 @@ def _build_dag(
                     if not el.model:
                         el.model = _model_for_states
 
+        # NOTE: agent-boundary transitions in this lane no longer need their
+        # own marker — the delegation tool call is now a visible node here
+        # (see tree.py's _reserve_marker_width) and the DFS branch-reset
+        # separator (is_branch_reset, stamped in the finalization pass below)
+        # already marks every "enter a new sibling" boundary. A "return to
+        # the parent and continue" transition (delegate's last call ->
+        # delegating agent's next call) isn't itself entering a new branch,
+        # so it renders plainly — the Agents lane already shows which agent
+        # owns which span.
+
         call_lane.sequence = elems
         lanes.append(call_lane)
 
@@ -594,8 +792,35 @@ def _build_dag(
                 call_lane.sequence.append(injected)
                 call_ts.add(bts)
 
+        # Blocked-action ghost markers: a BLOCK/TERMINATE/SKIP/BLACKLIST
+        # decision stops the call before the engine ever runs it, so there is
+        # no execution record to hang a bar on. WHOSE ghost this is (agent_id,
+        # decision, reason, policy — see governance.py's _collect_blocked_actions)
+        # is already fully known from the governance_decision event's own real
+        # ids; the tolerance search below only decides which EXISTING visual
+        # state to hang that already-identified ghost's hover/badge on, in the
+        # absence of any execution record to attach it to directly — it never
+        # guesses which call was blocked. Injects a connector-only marker
+        # state when nothing already sits at that boundary — same technique
+        # used above for agent-boundary timestamps.
+        for ghost in blocked:
+            gts = ghost["ts"]
+            close_ts = next((ex for ex in call_ts if abs(gts - ex) <= _TS_TOL), None)
+            if close_ts is not None:
+                gstate = state_reg[close_ts]
+            else:
+                gstate = state(gts)
+                call_lane.connector_only_ts.add(gts)
+                call_lane.sequence.append(gstate)
+                call_ts.add(gts)
+            gstate.governance.append({
+                "decision":   ghost["decision"],
+                "reason":     ghost["reason"],
+                "policyName": ghost["policyName"],
+            })
+
     # ── Thinking lane: one ThinkingCall per LLM call that has thinking content
-    thinking_records = _synthesize_thinking_records(records)
+    thinking_records = _synthesize_thinking_records(records) if "thinking" in facets else []
     thinking_sub_tss: list[float] = []   # intermediate state ts values (for letter labels)
 
     # Build a map from LLM call_id → staggered start_ts so the thinking lane
@@ -677,6 +902,104 @@ def _build_dag(
         thinking_lane.sequence = telems
         lanes.append(thinking_lane)
 
+    # ── Governance lane: one bar per governed call + one instant marker per
+    # blocked action, all reusing the exact state boundaries already
+    # registered by the calls lane — so this lane adds no new timestamps of
+    # its own and cannot violate the shared-state alignment other lanes rely
+    # on. Hidden by default in the renderer to avoid clutter; toggled on to
+    # see governance impact consolidated in one place instead of per-call
+    # badges. Built from the same facet data as the Phase 2 badges/markers.
+    _gov_intervals: list[tuple[float, float, str, str, list[dict]]] = []
+    for _gcid, _gdata in gov_map.items():
+        _grec = rec_by_id.get(_gcid)
+        if _grec is None:
+            continue
+        _gdecision, _gct, _ = _governance_severity(_gdata)
+        _gov_intervals.append((_grec["start_ts"], _grec["end_ts"], _gct, _gdecision, _gdata))
+    for _ghost in blocked:
+        _gov_intervals.append((_ghost["ts"], _ghost["ts"], "GovernanceBlock", "BLOCK", [{
+            "hook": "egress", "checkpoint": "after",
+            "decision": _ghost["decision"], "reason": _ghost["reason"],
+            "policyName": _ghost["policyName"],
+        }]))
+
+    if _gov_intervals:
+        _gov_intervals.sort(key=lambda iv: iv[0])
+        gov_lane = LaneDef("governance", "governance", "Governance")
+        gelems: list = []
+        _gov_cursor = -1.0
+        for _gi, (_gs, _ge, _gct, _glabel, _gdata) in enumerate(_gov_intervals):
+            if _gs < _gov_cursor - _TS_TOL:
+                # Overlaps the previous bar — skip rather than corrupt ordering.
+                # _align_record_boundaries (tree.py) sometimes widens a call's
+                # rendered window to fill a visual gap to its neighbour; when
+                # that widened window swallows an earlier ghost's timestamp,
+                # the ghost is dropped from this lane only — it still renders
+                # on its own Calls-lane state boundary (see the block above).
+                continue
+            if not gelems:
+                gelems.append(state(_gs))
+            gelems.append(trans(
+                {"agent_id": "", "input": "", "output": "", "call_id": f"gov-{_gi}"},
+                lane_level="governance", node_id=f"tr-gov-{_gi}",
+                call_type=_gct, label=_glabel,
+                start_ts=_gs, end_ts=_ge,
+            ))
+            gelems[-1].governance = _gdata
+            gelems[-1].is_instant = abs(_ge - _gs) <= _TS_TOL
+            gelems.append(state(_ge))
+            _gov_cursor = _ge
+        if gelems:
+            gov_lane.sequence = gelems
+            lanes.append(gov_lane)
+
+    # ── DFS virtual-position axis: stamp dfs_pos/branch_id onto every node ──
+    # _ts_to_dfs_pos (from _assign_dfs_positions) only covers timestamps that
+    # appear in call_sequence (the Calls lane) — extend it to every timestamp
+    # in state_reg (session/MAS boundaries, HITL gaps, etc. share most of the
+    # same timestamps via _align_record_boundaries, but not necessarily all)
+    # by interpolating between the nearest covered neighbors in real time.
+    _all_ts = sorted(state_reg.keys())
+    _covered = sorted(_ts_to_dfs_pos)
+    if _covered:
+        for _ts in _all_ts:
+            if _ts in _ts_to_dfs_pos:
+                continue
+            _lo = next((c for c in reversed(_covered) if c <= _ts), None)
+            _hi = next((c for c in _covered if c >= _ts), None)
+            if _lo is None:
+                _ts_to_dfs_pos[_ts] = _ts_to_dfs_pos[_covered[0]] - (_covered[0] - _ts)
+            elif _hi is None:
+                _ts_to_dfs_pos[_ts] = _ts_to_dfs_pos[_covered[-1]] + (_ts - _covered[-1])
+            elif _lo == _hi:
+                _ts_to_dfs_pos[_ts] = _ts_to_dfs_pos[_lo]
+            else:
+                _frac = (_ts - _lo) / (_hi - _lo)
+                _ts_to_dfs_pos[_ts] = (
+                    _ts_to_dfs_pos[_lo] + _frac * (_ts_to_dfs_pos[_hi] - _ts_to_dfs_pos[_lo])
+                )
+    else:
+        _ts_to_dfs_pos = {_ts: float(_i) for _i, _ts in enumerate(_all_ts)}
+
+    # branch_id: the real call_id of the branch's own child (see
+    # _detect_delegation_forks — "Fork branch node id = children ID", not a
+    # synthetic counter), stamped on the reset boundary itself. _reset_branch_id
+    # (from _assign_dfs_positions) is keyed by the ts the reset actually landed
+    # on — strictly after the delegating tool call's own marker, not at it.
+    for _ts, _node in state_reg.items():
+        _node.dfs_pos = _ts_to_dfs_pos.get(_ts, 0.0)
+        _node.is_branch_reset = _ts in _reset_branch_id
+        if _ts in _reset_branch_id:
+            _node.branch_id = _reset_branch_id[_ts]
+
+    for _lane in lanes:
+        for _el in _lane.sequence:
+            if isinstance(_el, TransNode):
+                _el.dfs_pos_start = _ts_to_dfs_pos.get(_el.start_ts, 0.0)
+                _el.dfs_pos_end   = _ts_to_dfs_pos.get(_el.end_ts, 0.0)
+                if _el.start_ts in _reset_branch_id:
+                    _el.branch_id = _reset_branch_id[_el.start_ts]
+
     # ── Assign letter-suffix labels to thinking sub-states (S2 → S2a, S2b …)
     if thinking_sub_tss:
         from collections import defaultdict as _defdict
@@ -693,11 +1016,11 @@ def _build_dag(
             for _idx, _ts in enumerate(sorted(_subs)):
                 state_reg[_ts].label_override = f"S{_pn}{chr(ord('a') + _idx)}"
 
-    # ── Reassign sequential IDs globally (chronological, level as tiebreaker)
-    _LEVEL_ORDER = {"session": 0, "mas": 1, "agent": 2, "call": 3, "thinking": 4}
+    # ── Reassign sequential IDs globally (DFS order, level as tiebreaker)
+    _LEVEL_ORDER = {"session": 0, "mas": 1, "agent": 2, "call": 3, "thinking": 4, "governance": 5}
     all_trans = [el for lane in lanes for el in lane.sequence
                  if isinstance(el, TransNode)]
-    all_trans.sort(key=lambda t: (t.start_ts, _LEVEL_ORDER.get(t.level, 9)))
+    all_trans.sort(key=lambda t: (t.dfs_pos_start, _LEVEL_ORDER.get(t.level, 9)))
     for i, t in enumerate(all_trans):
         t.seq = i + 1
 

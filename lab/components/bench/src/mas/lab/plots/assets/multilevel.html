@@ -139,6 +139,7 @@ body{font-family:'Inter',ui-sans-serif,sans-serif;background:#0f172a;color:#e2e8
   <div id="lane-track" style="position:relative;height:22px;border-radius:4px;border:1px solid #334155;display:inline-flex;overflow:visible;cursor:default"></div>
   <span id="lpk-label" style="color:#7dd3fc;font-size:.78rem;min-width:100px;display:inline-block"></span>
   <button id="btn-ann" style="display:none;color:#fca5a5;border-color:#7f1d1d">&#128204; <span id="ann-count">0</span> annotation(s)</button>
+  <button id="btn-gov-lane" title="Toggle a dedicated Governance lane (decisions + blocked actions consolidated in one row)">&#9860; Governance lane</button>
 </div>
 <div id="chart-wrap"><svg id="chart"></svg></div>
 <div id="tooltip"><div id="tt-title"></div><hr id="tt-sep"><div id="tt-body"></div></div>
@@ -174,7 +175,7 @@ _buildAllPins();
 
 // ── Geometry constants ───────────────────────────────────────────────────
 const LW=108,PL=80,PR=80,TH=48,LGH=34,LH=68,LM=34,PB=20,TAH=24;
-const SW=34,SH=26,TRH=26,BR=10,AG=10,MIN_TRANS_W=80,MINCOL=150,TS_TOL=0.05,INSTANT_COL_W=130;
+const SW=34,SH=26,TRH=26,BR=10,AG=10,MIN_TRANS_W=80,MINCOL=150,TS_TOL=0.05,INSTANT_COL_W=130,RESET_COL_W=56;
 const UA_OFFSET=60; // px from boundary-state centre to user box centre
 
 // ── Colours ──────────────────────────────────────────────────────────────
@@ -191,23 +192,17 @@ const C={
 };
 
 // ── Layout ───────────────────────────────────────────────────────────────
-// Build exact set of genuine instant-call column intervals.
-// Only ToolCall / MemoryCall / RAGQuery (isInstant=true, startTs≠endTs) generate
-// dedicated icon columns.  ProcessingCall overlays its own state bucket and is
-// excluded here because its startTs===endTs (sameTs=true in Phase 4).
-// Key: "${startTs}:${endTs}" with the raw float values from the data.
-let INSTANT_PAIRS = new Set();
-function _buildInstantPairs() {
-  INSTANT_PAIRS.clear();
-  CHART.lanes.forEach(lane => {
-    lane.sequence.forEach(el => {
-      if (el.type==='trans' && el.isInstant && el.callType!=='ProcessingCall')
-        INSTANT_PAIRS.add(`${el.startTs}:${el.endTs}`);
-    });
-  });
+// Per-gap classification comes from the server (chart_data.py's bucket_gaps):
+// one entry per adjacent pair in CHART.buckets (which are already ordered by
+// DFS virtual position, not raw timestamp — see dag.py's finalization pass).
+// "instant" = a near-zero-duration call (e.g. a delegation dispatch marker);
+// "reset" = a branch boundary (going back up the call tree and descending
+// into a new sibling); both get a small fixed column width, never
+// time-proportional and never scaled by zoom. Everything else is "normal".
+function gapKind(i) {
+  const gaps = CHART.bucketGaps;
+  return (gaps && gaps[i]) ? gaps[i].kind : 'normal';
 }
-_buildInstantPairs();
-function isInstantCol(prev, b) { return INSTANT_PAIRS.has(`${prev}:${b}`); }
 
 function computeBaseXPos(buckets, mode) {
   const n = buckets.length;
@@ -220,24 +215,24 @@ function computeBaseXPos(buckets, mode) {
     raw = buckets.slice(1).map((b,i)=>Math.pow(Math.log1p(Math.max(0,b-buckets[i])),0.5));
   else
     raw = new Array(n-1).fill(1);
-  // Classify intervals: only genuine instant-call columns get fixed narrow width.
-  const isInst = buckets.slice(1).map((b,i)=>isInstantCol(buckets[i],b));
-  const normalRaw = raw.filter((_,i)=>!isInst[i]);
+  const kinds = raw.map((_,i)=>gapKind(i));
+  const normalRaw = raw.filter((_,i)=>kinds[i]==='normal');
   const normalTot = normalRaw.reduce((a,b)=>a+b,0)||1;
   const normalTotal = Math.max(1400, normalRaw.length*160);
   const pos={[buckets[0]]:LW+PL};
   let x=LW+PL;
   raw.forEach((r,i)=>{
-    if (isInst[i]) { x+=INSTANT_COL_W; }
-    else           { x+=Math.max(MINCOL, r/normalTot*normalTotal); }
+    if (kinds[i]==='instant')    { x+=INSTANT_COL_W; }
+    else if (kinds[i]==='reset') { x+=RESET_COL_W; }
+    else                         { x+=Math.max(MINCOL, r/normalTot*normalTotal); }
     pos[buckets[i+1]]=x;
   });
   return pos;
 }
 
 function applyZoom(base, tx, k) {
-  // Instant columns are always exactly INSTANT_COL_W px wide, regardless of
-  // zoom — the icon must stay centred with equal arrows on both sides.
+  // Instant/reset columns are always a fixed width, regardless of zoom — an
+  // icon or separator needs to stay centred / at a stable, clickable width.
   // Normal columns scale with k, subject to a minimum of SW+4 px.
   const sorted = CHART.buckets;
   const out={};
@@ -245,9 +240,10 @@ function applyZoom(base, tx, k) {
     const b=sorted[i];
     if (i===0) { out[b]=LW+(base[b]-LW)*k+tx; continue; }
     const prev=sorted[i-1];
-    if (isInstantCol(prev,b)) {
-      out[b]=out[prev]+INSTANT_COL_W;  // fixed — never scales
-    } else {
+    const kind=gapKind(i-1);
+    if (kind==='instant')    { out[b]=out[prev]+INSTANT_COL_W; }
+    else if (kind==='reset') { out[b]=out[prev]+RESET_COL_W; }
+    else {
       const raw=LW+(base[b]-LW)*k+tx;
       out[b]=Math.max(raw, out[prev]+SW+4);
     }
@@ -256,9 +252,10 @@ function applyZoom(base, tx, k) {
 }
 
 // Compute the minimum zoom level below which any column would be too narrow.
-// Evaluated per-column so instant and normal columns use different thresholds:
-//   instant  → INSTANT_COL_W (enough to centre the icon with arrows on both sides)
-//   normal   → SW + 2*AG + 24 + 4 = 82 px (two half-boxes + arrows + 24 px bar)
+// Evaluated per-column so instant/reset and normal columns use different
+// thresholds:
+//   instant/reset → fixed column width (enough to centre the icon/separator)
+//   normal        → SW + 2*AG + 24 + 4 = 82 px (two half-boxes + arrows + 24 px bar)
 // The minimum zoom is the maximum ratio needed across all column types.
 function computeMinZoom(base) {
   const sorted = CHART.buckets;
@@ -266,8 +263,8 @@ function computeMinZoom(base) {
   let maxRatio = 0;
   for (let i=1; i<sorted.length; i++) {
     const gap = base[sorted[i]] - base[sorted[i-1]];
-    const isInst = isInstantCol(sorted[i-1], sorted[i]);
-    const needed = isInst ? INSTANT_COL_W : SW + 2*AG + 24 + 4;
+    const kind = gapKind(i-1);
+    const needed = kind==='instant' ? INSTANT_COL_W : kind==='reset' ? RESET_COL_W : SW + 2*AG + 24 + 4;
     maxRatio = Math.max(maxRatio, needed / gap);
   }
   return Math.max(0.05, maxRatio);
@@ -294,6 +291,9 @@ const TYPE_BADGE={
   MITMCall:       {label:'MITM',   color:'#dc2626'},
   ThinkingCall:   {label:'Think',  color:'#7c3aed'},
   ThinkingEmit:   {label:'Emit',   color:'#4c1d95'},
+  GovernanceBlock:   {label:'Gov', color:'#ef4444'},
+  GovernanceCaution: {label:'Gov', color:'#f59e0b'},
+  GovernanceAllow:   {label:'Gov', color:'#64748b'},
 };
 function escH(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 // hlGap: escape text, then wrap the given excerpt (or legacy gapPhrases) in
@@ -318,6 +318,33 @@ function hlGap(txt, excerpt) {
 function pinHeader(note) {
   if (!note) return '';
   return '<div style="color:#ef4444;font-size:.74rem;font-weight:600;padding:.18rem 0 .35rem 0;border-bottom:1px solid #334155;margin-bottom:.38rem">&#9873; '+escH(note)+'</div>';
+}
+// Governance decision colouring: red for actions that stopped or rerouted
+// the call, amber for ones that paused or retried it, grey for anything
+// merely logged/allowed.
+const GOV_DECISION_COLOR={
+  BLOCK:'#ef4444', TERMINATE:'#ef4444', BLACKLIST:'#ef4444',
+  HITL:'#f59e0b', RETRY:'#f59e0b', SKIP:'#f59e0b', MODIFY:'#f59e0b',
+  ALLOW:'#64748b', LOG:'#64748b',
+};
+// Governance section HTML for the pinned panel — decision/reason/policy per
+// hook (egress/ingress), so a click on the badge shows exactly what governed
+// this call and why.
+function govSummaryText(governance) {
+  if (!governance || !governance.length) return '';
+  return governance.map(g=>`${g.decision||'?'}${g.policyName?' ('+g.policyName+')':''}: ${g.reason||''}`).join('\n');
+}
+function govHtml(governance) {
+  if (!governance || !governance.length) return '';
+  const rows=governance.map(g=>{
+    const c=GOV_DECISION_COLOR[g.decision]||'#64748b';
+    return `<div style="padding:.3rem 0;border-top:1px solid #334155">`
+      +`<span style="background:${c};color:#fff;font-size:.68rem;font-weight:700;padding:.08rem .4rem;border-radius:3px;font-family:ui-monospace,monospace">${escH(g.decision||'?')}</span>`
+      +` <span style="color:#94a3b8;font-size:.72rem">${escH(g.hook||'')}${g.checkpoint?' · '+escH(g.checkpoint):''}${g.policyName?' · '+escH(g.policyName):''}</span>`
+      +(g.reason?`<div style="margin-top:.2rem;font-size:.78rem;color:#e2e8f0">${escH(g.reason)}</div>`:'')
+      +`</div>`;
+  }).join('');
+  return `<div style="margin-top:.5rem"><div style="color:#94a3b8;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em">&#9860; Governance</div>${rows}</div>`;
 }
 function showTip(e, label, content, callType, excerpt, pinNote, cprData) {
   const tm=callType&&TYPE_BADGE[callType];
@@ -584,16 +611,18 @@ document.getElementById('pp-header').addEventListener('mousedown',e=>{
 });
 document.addEventListener('mousemove',e=>{if(!_pdragging)return;panel.style.right='auto';panel.style.left=(e.clientX-_pdx)+'px';panel.style.top=(e.clientY-_pdy)+'px';});
 document.addEventListener('mouseup',()=>{_pdragging=false;});
-function pinTip(e,label,content,callType,excerpt,pinNote,cprData,model,hoverOut){
+function pinTip(e,label,content,callType,excerpt,pinNote,cprData,model,hoverOut,governance){
   const tm=callType&&TYPE_BADGE[callType];
   ppTitle.innerHTML=`<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escH(label)}</span>`
     +(tm?`<span style="flex-shrink:0;background:${tm.color};color:#fff;font-size:.68rem;font-weight:700;padding:.1rem .42rem;border-radius:3px;letter-spacing:.05em;font-family:ui-monospace,monospace">${tm.label}</span>`:'');
   if (cprData && cprData.length) {
     // Extract timeLine from content (first line) — only for transitions (callType set)
     const timeLine = (callType && content) ? content.split('\n')[0] : '';
-    ppBody.innerHTML = pinHeader(pinNote) + renderCprCard(cprData, model||'', hoverOut||'', timeLine);
+    ppBody.innerHTML = pinHeader(pinNote) + renderCprCard(cprData, model||'', hoverOut||'', timeLine) + govHtml(governance);
+  } else if (content) {
+    ppBody.innerHTML=pinHeader(pinNote)+hlGap(content,excerpt)+govHtml(governance);
   } else {
-    ppBody.innerHTML=pinHeader(pinNote)+hlGap(content,excerpt);
+    ppBody.innerHTML=pinHeader(pinNote)+govHtml(governance);
   }
   panel.style.display='block';
   panel.style.right='auto';
@@ -648,9 +677,20 @@ function _wireCprInteraction(container) {
 const svg=d3.select('#chart');
 let nLanes=CHART.lanes.length; // total (for clip)
 let laneFrom=0, laneTo=nLanes-1;
-function visibleCount(){return laneTo-laneFrom+1;}
-function visibleLanes(){return CHART.lanes.slice(laneFrom,laneTo+1);}
-function toVisibleIdx(i){return(i>=laneFrom&&i<=laneTo)?i-laneFrom:-1;}
+// Lanes hidden by id regardless of the laneFrom/laneTo range slider — used
+// for the Governance lane, which is opt-in (hidden by default to avoid
+// cluttering the main view; the same data is already on the per-call badges).
+const hiddenLaneIds=new Set(['governance']);
+function visibleLanes(){return CHART.lanes.slice(laneFrom,laneTo+1).filter(l=>!hiddenLaneIds.has(l.laneId));}
+function visibleCount(){return visibleLanes().length;}
+function toVisibleIdx(i){
+  if (i<laneFrom||i>laneTo) return -1;
+  const lane=CHART.lanes[i];
+  if (!lane||hiddenLaneIds.has(lane.laneId)) return -1;
+  let idx=0;
+  for (let j=laneFrom;j<i;j++) if(!hiddenLaneIds.has(CHART.lanes[j].laneId)) idx++;
+  return idx;
+}
 function getH(){return TH+LGH+visibleCount()*LH+PB+(CHART.showTimeAxis?TAH:0);}
 svg.attr('height',getH());
 
@@ -736,132 +776,31 @@ function redraw(xPos) {
 
   const ph0=dynG.append('g'), ph1=dynG.append('g'), ph2=dynG.append('g'), ph3=dynG.append('g'), ph4=dynG.append('g');
 
-  function drawDiamondMarker(group, x, y, label, fill, stroke, title, content, countLabel=null) {
-    const size=8;
-    const pts=`${x},${y-size} ${x+size},${y} ${x},${y+size} ${x-size},${y}`;
-    group.append('polygon')
-      .attr('points',pts)
-      .attr('fill',fill)
-      .attr('stroke',stroke)
-      .attr('stroke-width',1.6)
-      .style('cursor','pointer')
-      .on('mousemove',e=>showTip(e,title,content))
-      .on('mouseleave',hideTip)
-      .on('click',e=>{e.stopPropagation();pinTip(e,title,content);});
-    group.append('text')
-      .attr('x',x).attr('y',y+3)
-      .attr('text-anchor','middle').attr('font-size',8)
-      .attr('font-weight','bold').attr('fill','#e0f2fe')
-      .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
-      .text(label);
-    if (countLabel) {
-      group.append('text')
-        .attr('x',x).attr('y',y-12)
-        .attr('text-anchor','middle').attr('font-size',8)
-        .attr('font-weight','bold').attr('fill',stroke)
+  // Phase 0: branch-reset separators ──────────────────────────────────────
+  // One full-height dashed vertical line per DFS branch boundary (going back
+  // up the call tree and descending into a new sibling — see dag.py's
+  // is_branch_reset), spanning every lane so it reads as "the timeline resets
+  // here" regardless of which lane you're looking at. Position comes from
+  // CHART.bucketGaps (kind==='reset'), the same classification driving the
+  // fixed-width reset column in the x-axis functions above.
+  const topY=TH+LGH, botY=TH+LGH+visibleLanes().length*LH;
+  CHART.buckets.forEach((b,i)=>{
+    if (i===0) return;
+    const gap=CHART.bucketGaps && CHART.bucketGaps[i-1];
+    if (!gap || gap.kind!=='reset') return;
+    const x=cx(b,xPos);
+    ph0.append('line')
+      .attr('x1',x).attr('y1',topY).attr('x2',x).attr('y2',botY)
+      .attr('stroke','#f59e0b').attr('stroke-width',1.5)
+      .attr('stroke-dasharray','6,4').attr('opacity',0.55)
+      .attr('pointer-events','none');
+    if (gap.branchId) {
+      ph0.append('text')
+        .attr('x',x+4).attr('y',topY+12)
+        .attr('font-size',8).attr('fill','#f59e0b').attr('opacity',0.8)
         .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
-        .text(countLabel);
+        .text(`branch: ${gap.branchId}`);
     }
-  }
-
-  function drawBranchMarker(group, x, y, label, title, content, fill='#1f2937', stroke='#f59e0b', textFill='#fef3c7') {
-    const bw=28, bh=16, cut=5;
-    const pts=[
-      [x-bw/2+cut,y-bh/2],[x+bw/2-cut,y-bh/2],[x+bw/2,y],
-      [x+bw/2-cut,y+bh/2],[x-bw/2+cut,y+bh/2],[x-bw/2,y]
-    ].map(p=>p.join(',')).join(' ');
-    group.append('polygon')
-      .attr('points',pts)
-      .attr('fill',fill)
-      .attr('stroke',stroke)
-      .attr('stroke-width',1.4)
-      .style('cursor','pointer')
-      .on('mousemove',e=>showTip(e,title,content))
-      .on('mouseleave',hideTip)
-      .on('click',e=>{e.stopPropagation();pinTip(e,title,content);});
-    group.append('text')
-      .attr('x',x).attr('y',y+3)
-      .attr('text-anchor','middle').attr('font-size',8)
-      .attr('font-weight','bold').attr('fill',textFill)
-      .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
-      .text(label);
-  }
-
-  function drawRepeatStateToken(group, x, y, label, title, content) {
-    const w=24, h=12;
-    group.append('rect')
-      .attr('x',x-w/2).attr('y',y-h/2)
-      .attr('width',w).attr('height',h)
-      .attr('rx',3)
-      .attr('fill','#111827')
-      .attr('stroke','#93c5fd')
-      .attr('stroke-width',1.2)
-      .attr('stroke-dasharray','3,2')
-      .style('cursor','pointer')
-      .on('mousemove',e=>showTip(e,title,content))
-      .on('mouseleave',hideTip)
-      .on('click',e=>{e.stopPropagation();pinTip(e,title,content);});
-    group.append('text')
-      .attr('x',x).attr('y',y+3)
-      .attr('text-anchor','middle').attr('font-size',7)
-      .attr('font-weight','bold').attr('fill','#dbeafe')
-      .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
-      .text(label);
-  }
-
-  const parallelGroupOrder=Array.from(new Map(
-    CHART.lanes.flatMap(lane=>lane.sequence)
-      .filter(el=>el.parallelGroupId)
-      .map(el=>[el.parallelGroupId, ('startTs' in el ? el.startTs : el.ts)])
-  ).entries())
-    .sort((a,b)=>a[1]-b[1])
-    .reduce((acc,[gid],idx)=>acc.set(gid,idx+1), new Map());
-
-  function parallelGroupNo(groupId) {
-    return parallelGroupOrder.get(groupId)||0;
-  }
-
-  function branchListLabel(size) {
-    return Array.from({length: Math.max(0,size||0)}, (_, idx)=>`B${idx+1}`).join(' ');
-  }
-
-  function agentParallelSlot(lane, tr){
-    if (lane.level!=='agent' || !tr.parallelGroupId || (tr.parallelSize||1)<=1) return null;
-    const span=(lane.parallelSpans||[]).find(s=>Math.abs(s.startTs-tr.startTs)<0.01 && s.size===tr.parallelSize)
-      || (lane.parallelSpans||[])[0];
-    if (!span) return null;
-    const gx1=cx(span.startTs,xPos)+SW/2+AG;
-    const gx2=cx(span.endTs,xPos)-SW/2-AG;
-    const n=Math.max(1,tr.parallelSize||1);
-    const gap=10;
-    const avail=Math.max(gx2-gx1, MIN_TRANS_W*n);
-    const slotW=Math.max(MIN_TRANS_W,(avail-gap*(n-1))/n);
-    const rank=Math.max(0,tr.parallelRank||0);
-    const x1=gx1+rank*(slotW+gap);
-    return [x1, x1+slotW];
-  }
-
-  // Phase 0: parallel-group background bands ──────────────────────────────
-  // For each lane carrying parallelSpans, draw a tinted band + fork/join borders.
-  visibleLanes().forEach((lane,li)=>{
-    if (!lane.parallelSpans||!lane.parallelSpans.length) return;
-    const cy=TH+LGH+li*LH+LM;
-    const lt=TH+LGH+li*LH+1;
-    const gh=LH-2;
-    lane.parallelSpans.forEach(span=>{
-      const x1=cx(span.startTs,xPos)-SW/2-4;
-      const x2=cx(span.endTs,  xPos)+SW/2+4;
-      const bw=Math.max(x2-x1,10);
-      ph0.append('rect').attr('x',x1).attr('y',lt).attr('width',bw).attr('height',gh)
-        .attr('rx',3).attr('fill','#0c2a4a').attr('opacity',0.6)
-        .attr('pointer-events','none');
-      [x1,x2].forEach(vx=>{
-        ph0.append('line')
-          .attr('x1',vx).attr('y1',lt).attr('x2',vx).attr('y2',lt+gh)
-          .attr('stroke','#7dd3fc').attr('stroke-width',1.5)
-          .attr('stroke-dasharray','4,3').attr('opacity',0.7);
-      });
-    });
   });
 
   // Phase 1: lifelines + transitions ─────────────────────────────────────
@@ -891,8 +830,7 @@ function redraw(xPos) {
 
       // If this lane has an instant-call icon at startTs, the bar must start
       // after the icon (state_right + 4 + SW + AG) to avoid overlap.
-      const slot=agentParallelSlot(lane,tr);
-      const xl=slot ? slot[0] : cx(tr.startTs,xPos)+SW/2+AG;
+      const xl=cx(tr.startTs,xPos)+SW/2+AG;
 
       // Concurrent-agent overlap fix: when concurrent calls from different
       // agents are merged into one lane, a long bar (e.g. LLM call from agent A)
@@ -900,10 +838,10 @@ function redraw(xPos) {
       // agent A is still running).  Clip the bar's right edge to the visual
       // start of the next transition so all elements appear as a clean sequence.
       const nextTr=lane.sequence[idx+2];
-      const clipX=slot ? Infinity : ((nextTr&&nextTr.type==='trans'&&nextTr.startTs<tr.endTs)
+      const clipX=(nextTr&&nextTr.type==='trans'&&nextTr.startTs<tr.endTs)
         ? cx(nextTr.startTs,xPos)-SW/2-AG
-        : Infinity);
-      const xr_nat=slot ? slot[1] : Math.min(cx(tr.endTs,xPos)-SW/2-AG, isFinite(clipX)?clipX:Infinity);
+        : Infinity;
+      const xr_nat=Math.min(cx(tr.endTs,xPos)-SW/2-AG, isFinite(clipX)?clipX:Infinity);
 
       // When the natural width is negative, the destination state box sits visually
       // BEFORE or AT the bar's start (concurrent-agent lane ordering artefact).
@@ -921,26 +859,19 @@ function redraw(xPos) {
       // tw_natural: actual column space available for this transition rect.
       const tw_natural=xr_nat-xl;
       const xr=Math.max(xr_nat, xl+Math.min(MIN_TRANS_W, tw_natural));
-      const tw=xr-xl, ty=cy-TRH/2;
+      const ty=cy-TRH/2;
       const _trKW=_kwMatch(tr.label)||_kwMatch(tr.hoverIn)||_kwMatch(tr.hoverOut);
-      const prevState=(lane.sequence[idx-1]&&lane.sequence[idx-1].type==='state') ? lane.sequence[idx-1] : null;
-      const repeatedStateLabel=prevState ? (prevState.labelOverride || `S${prevState.num}`) : 'S?';
-      const repeatedStateToken=`${repeatedStateLabel}↺`;
-      let barLeft=xl, barRight=xr;
-      let closeMarkerLeft=null, closeMarkerRight=null;
-      if (tr.parallelGroupId && tw>=86) {
-        barLeft=Math.min(xr-34, xl+32);
-        closeMarkerLeft=xr-30;
-        closeMarkerRight=xr-2;
-        barRight=Math.max(barLeft+14, closeMarkerLeft-6);
-      }
+      // Which branch (if any) this bar belongs to is shown by the full-height
+      // reset separator drawn once per branch boundary (see the dedicated
+      // pass before Phase 0) — no per-bar tag needed here.
+      const barLeft=xl, barRight=xr;
       const barMid=(barLeft+barRight)/2;
       ph1.append('rect').attr('x',barLeft).attr('y',ty).attr('width',Math.max(2,barRight-barLeft)).attr('height',TRH)
         .attr('rx',4).attr('fill',tr.color)
         .attr('stroke','none')
         .style('cursor','pointer')
         .on('mousemove',e=>showTip(e,tr.label,content,tr.callType,null,null,tr.cprData)).on('mouseleave',hideTip)
-        .on('click',e=>{e.stopPropagation();pinTip(e,tr.label,content,tr.callType,null,null,tr.cprData,tr.model,tr.hoverOut);});
+        .on('click',e=>{e.stopPropagation();pinTip(e,tr.label,content,tr.callType,null,null,tr.cprData,tr.model,tr.hoverOut,tr.governance);});
       // Label: truncate proportionally to natural column width; hide entirely
       // below 16 px so text never overflows into adjacent state boxes.
       const maxC=Math.max(0,Math.floor((barRight-barLeft)/8));
@@ -956,79 +887,39 @@ function redraw(xPos) {
         .attr('font-size',9).attr('font-weight','bold').attr('fill','#fff')
         .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
         .text(tr.seq);
-      const ax0=cx(tr.startTs,xPos)+SW/2;
-      let branchRight=null;
-      // Distinct branch marker before each branch start.
-      if (tr.parallelGroupId) {
-        const groupNo=parallelGroupNo(tr.parallelGroupId);
-        const branchLabel=`B${1+(tr.parallelRank||0)}`;
-        const markerX=Math.min(xl-18, Math.max(ax0+18, xl-22));
-        const branchLeft=markerX-14;
-        branchRight=markerX+14;
-        if (branchLeft-ax0>2)
-          ph1.append('line').attr('x1',ax0).attr('y1',cy).attr('x2',branchLeft).attr('y2',cy)
-            .attr('stroke','#f59e0b').attr('stroke-width',1.6).attr('opacity',0.95);
-        drawBranchMarker(
-          ph1,
-          markerX,
-          cy,
-          branchLabel,
-          `${branchLabel} branch`,
-          `${branchLabel} from fork F${groupNo} in ${branchListLabel(tr.parallelSize||2)}`
-        );
-        const repeatStateX=Math.min(xr-40, xl+14);
-        const repeatStateLeft=repeatStateX-12;
-        const repeatStateRight=repeatStateX+12;
-        if (repeatStateLeft-branchRight>2)
-          ph1.append('line').attr('x1',branchRight).attr('y1',cy).attr('x2',repeatStateLeft).attr('y2',cy)
-            .attr('stroke','#f59e0b').attr('stroke-width',1.6).attr('marker-end','url(#arr)')
-            .attr('opacity',0.95);
-        drawRepeatStateToken(
-          ph1,
-          repeatStateX,
-          cy,
-          repeatedStateToken,
-          `${branchLabel} repeated state`,
-          `Repeated entry state ${repeatedStateToken} for ${branchLabel}`
-        );
-        if (barLeft-repeatStateRight>2)
-          ph1.append('line').attr('x1',repeatStateRight).attr('y1',cy).attr('x2',barLeft).attr('y2',cy)
-            .attr('stroke','#93c5fd').attr('stroke-width',1.4).attr('opacity',0.9);
-        const branchFrameLeft=branchLeft-4;
-        const branchFrameRight=(closeMarkerRight!==null ? closeMarkerRight : xr)+4;
-        if (branchFrameRight-branchFrameLeft>24)
-          ph1.append('rect').attr('x',branchFrameLeft).attr('y',ty-4)
-            .attr('width',branchFrameRight-branchFrameLeft).attr('height',TRH+8)
-            .attr('rx',6).attr('fill','none').attr('stroke','#fbbf24')
-            .attr('stroke-width',1).attr('stroke-dasharray','4,3').attr('opacity',0.45);
-        if (closeMarkerLeft!==null && closeMarkerRight!==null) {
-          if (closeMarkerLeft-barRight>2)
-            ph1.append('line').attr('x1',barRight).attr('y1',cy).attr('x2',closeMarkerLeft).attr('y2',cy)
-              .attr('stroke','#fcd34d').attr('stroke-width',1.4).attr('opacity',0.9);
-          drawBranchMarker(
-            ph1,
-            (closeMarkerLeft+closeMarkerRight)/2,
-            cy,
-            `/${branchLabel}`,
-            `${branchLabel} end`,
-            `End of ${branchLabel}`,
-            '#3f2a12',
-            '#fcd34d',
-            '#fef3c7'
-          );
-        }
+      // Governance badge: a small shield to the left of the seq badge,
+      // coloured by the most severe decision that gated this call. Clicking
+      // it opens the same pinned panel with the governance section expanded.
+      const govColor=tr.governanceColor||null;
+      if (govColor) {
+        const gbx=bx-2*BR-3, gby=by;
+        ph1.append('circle').attr('cx',gbx).attr('cy',gby).attr('r',BR).attr('fill',govColor)
+          .style('cursor','pointer')
+          .on('mousemove',e=>showTip(e,tr.label,content,tr.callType,null,null,tr.cprData)).on('mouseleave',hideTip)
+          .on('click',e=>{e.stopPropagation();pinTip(e,tr.label,content,tr.callType,null,null,tr.cprData,tr.model,tr.hoverOut,tr.governance);});
+        ph1.append('text').attr('x',gbx).attr('y',gby+4).attr('text-anchor','middle')
+          .attr('font-size',9).attr('fill','#fff').attr('pointer-events','none')
+          .text('⛨');
       }
+      // Retry-attempt badge: a small "↻N" tag when this call is part of a
+      // governance-triggered retry chain.
+      if (tr.retryGroupId) {
+        ph1.append('text').attr('x',barLeft+3).attr('y',ty-3)
+          .attr('font-size',9).attr('font-weight','bold').attr('fill','#f59e0b')
+          .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
+          .text(`↻${tr.retryAttempt}`);
+      }
+      const ax0=cx(tr.startTs,xPos)+SW/2;
       // Arrows
-      if (!slot && !tr.parallelGroupId && xl-ax0>2)
+      if (xl-ax0>2)
         ph1.append('line').attr('x1',ax0).attr('y1',cy).attr('x2',xl).attr('y2',cy)
           .attr('stroke',C.arrow).attr('stroke-width',1.5).attr('marker-end','url(#arr)');
       // Right arrow: skip when clipped (the dotted lifeline connects to the end state)
-      const wasClipped=!slot && isFinite(clipX)&&clipX<cx(tr.endTs,xPos)-SW/2-AG;
-      if (!slot && !wasClipped) {
+      const wasClipped=isFinite(clipX)&&clipX<cx(tr.endTs,xPos)-SW/2-AG;
+      if (!wasClipped) {
         const ax1=cx(tr.endTs,xPos)-SW/2;
-        const rightStart=(closeMarkerRight!==null) ? closeMarkerRight : barRight;
-        if (ax1-rightStart>2)
-          ph1.append('line').attr('x1',rightStart).attr('y1',cy).attr('x2',ax1).attr('y2',cy)
+        if (ax1-barRight>2)
+          ph1.append('line').attr('x1',barRight).attr('y1',cy).attr('x2',ax1).attr('y2',cy)
             .attr('stroke',C.arrow).attr('stroke-width',1.5).attr('marker-end','url(#arr)');
       }
     });
@@ -1085,8 +976,11 @@ function redraw(xPos) {
       if (seen.has(st.ts)) return;
       seen.add(st.ts);
       // Connector-only states are injected for shared-bucket vertical connectors
-      // but should not render a visible box (they have no transition edges in this lane).
-      if (st.connectorOnly) return;
+      // but should not render a visible box (they have no transition edges in this
+      // lane) — except when a blocked governance action was attached to one (no
+      // execution record exists for a call that never ran, so its only anchor
+      // point in the lane is this otherwise-invisible marker state).
+      if (st.connectorOnly && !(st.governance&&st.governance.length)) return;
       const scx=cx(st.ts,xPos);
       const sx=scx-SW/2, sy=cy-SH/2;
       const lbl=st.labelOverride || `S${st.num}`;
@@ -1095,8 +989,10 @@ function redraw(xPos) {
       const stateFill   = st.interrupted ? '#2d1a00' : (st.isError ? '#2d0000' : C.stateF);
       const stateStroke = st.interrupted ? '#f59e0b' : (st.isError ? '#ef4444' : C.stateS);
       const stateTxt    = (st.interrupted || st.isError) ? stateStroke : C.stateT;
-      const prefix      = st.interrupted ? '\u26a0 TRACE CUT \u2014 agent was still running\n\n'
-                        : st.isError     ? '\u2717 EXECUTION ERROR\n\n' : '';
+      const prefix      = st.interrupted  ? '\u26a0 TRACE CUT \u2014 agent was still running\n\n'
+                        : st.isError      ? '\u2717 EXECUTION ERROR\n\n'
+                        : st.laneRestart  ? '\u21c4 AGENT HANDOFF \u2014 control passed to a different agent here\n\n'
+                        : '';
       // Prefer the lane-specific hover (populated per-lane for native-event
       // traces); fall back to any non-empty lane hover, then the global state
       // hover (KG traces), then a placeholder. Without this, native states
@@ -1106,6 +1002,18 @@ function redraw(xPos) {
       const hoverContent= prefix + (laneHover||'(no content)');
       const pinNote    = st.pinNote    || null;
       const pinExcerpt = st.pinExcerpt || null;
+      // Agent handoff: this boundary sits between two DIFFERENT agents' calls
+      // merged into the same lane row (e.g. a delegate's last call, then the
+      // delegator's next one) — without a marker here it reads as an
+      // arbitrary split in the middle of one continuous call.
+      if (st.laneRestart) {
+        ph3.append('rect').attr('x',sx-3).attr('y',sy-3).attr('width',SW+6).attr('height',SH+6)
+          .attr('rx',5).attr('fill','none').attr('stroke','#a78bfa').attr('stroke-width',2)
+          .attr('stroke-dasharray','2,2').attr('pointer-events','none');
+        ph3.append('text').attr('x',scx).attr('y',sy-4)
+          .attr('text-anchor','middle').attr('font-size',9).attr('fill','#a78bfa')
+          .attr('pointer-events','none').text('⇄');
+      }
       if (st.gapMarker) {
         // Ring border around state box
         ph3.append('rect').attr('x',sx-3).attr('y',sy-3).attr('width',SW+6).attr('height',SH+6)
@@ -1122,6 +1030,24 @@ function redraw(xPos) {
           .attr('fill','#fff').attr('pointer-events','none')
           .attr('font-family','ui-monospace,monospace').text(pidx>0?pidx:'!');
       }
+      // Blocked-action ghost marker: a governance decision stopped a call
+      // before the engine ever ran it, so there is no bar to draw — mark the
+      // state boundary itself with a dashed ring and a stop-sign flag.
+      if (st.governance && st.governance.length) {
+        const gColor=st.governanceColor||'#ef4444';
+        const gHoverContent=govSummaryText(st.governance);
+        ph3.append('rect').attr('x',sx-3).attr('y',sy-3).attr('width',SW+6).attr('height',SH+6)
+          .attr('rx',5).attr('fill','none').attr('stroke',gColor).attr('stroke-width',2)
+          .attr('stroke-dasharray','2,2').attr('pointer-events','none');
+        ph3.append('polygon')
+          .attr('points',`${scx-7},${sy-2} ${scx+7},${sy-2} ${scx},${sy-12}`)
+          .attr('fill',gColor).attr('opacity',0.95).style('cursor','pointer')
+          .on('mousemove',e=>showTip(e,'Blocked action',gHoverContent)).on('mouseleave',hideTip)
+          .on('click',e=>{e.stopPropagation();pinTip(e,'Blocked action','',null,null,null,null,'','',st.governance);});
+        ph3.append('text').attr('x',scx).attr('y',sy-4)
+          .attr('text-anchor','middle').attr('font-size',7).attr('font-weight','bold')
+          .attr('fill','#fff').attr('pointer-events','none').text('⛔');
+      }
       const stRect=ph3.append('rect').attr('x',sx).attr('y',sy).attr('width',SW).attr('height',SH)
         .attr('rx',3).attr('fill',stateFill).attr('stroke',stateStroke).attr('stroke-width',1.5)
         .style('cursor','pointer')
@@ -1131,49 +1057,11 @@ function redraw(xPos) {
       ph3.append('text').attr('x',scx).attr('y',cy+4).attr('text-anchor','middle')
         .attr('font-size',9).attr('font-weight','bold').attr('fill',stateTxt)
         .attr('pointer-events','none').attr('font-family','ui-monospace,monospace').text(lbl);
-      // Fork/join are rendered as dedicated timeline glyphs near the state, not as states.
-      // They are ONLY drawn in the agent lane — fork/join flags propagate via the shared
-      // StateNode registry to other lanes (e.g. calls), but those lanes should not repeat them.
-      if (st.isFork && st.parallelSize>=2 && lane.level==='agent') {
-        const groupNo=parallelGroupNo(st.parallelGroupId);
-        const branches=branchListLabel(st.parallelSize);
-        const forkX=scx+SW/2+AG+10;
-        ph3.append('line')
-          .attr('x1',scx+SW/2).attr('y1',cy)
-          .attr('x2',forkX-8).attr('y2',cy)
-          .attr('stroke','#38bdf8').attr('stroke-width',1.6).attr('opacity',0.95);
-        drawDiamondMarker(
-          ph3,
-          forkX,
-          cy,
-          `F${groupNo}`,
-          '#082f49',
-          '#38bdf8',
-          'Fork point',
-          `Fork F${groupNo} after ${lbl} into ${branches}`,
-          branches
-        );
-      }
-      if (st.isJoin && st.parallelSize>=2 && lane.level==='agent') {
-        const groupNo=parallelGroupNo(st.parallelGroupId);
-        const branches=branchListLabel(st.parallelSize);
-        const joinX=scx-SW/2-AG-10;
-        ph3.append('line')
-          .attr('x1',joinX+8).attr('y1',cy)
-          .attr('x2',scx-SW/2).attr('y2',cy)
-          .attr('stroke','#f59e0b').attr('stroke-width',1.6).attr('opacity',0.95);
-        drawDiamondMarker(
-          ph3,
-          joinX,
-          cy,
-          `J${groupNo}`,
-          '#3f1d0b',
-          '#f59e0b',
-          'Join point',
-          `Join J${groupNo} before ${lbl} from ${branches}`,
-          branches
-        );
-      }
+      // Fork/join points no longer get their own glyph — the full-height
+      // reset separator (drawn once per branch boundary, see the dedicated
+      // pass before Phase 0) already marks every "enter a new branch" moment
+      // across the whole plot height, which is clearer than a small diamond
+      // squeezed next to the state box.
       // Small badge icon at top-right corner of the box for interrupted/error states.
       if (st.interrupted||st.isError) {
         const badge=st.interrupted?'\u26a0':'\u2717';
@@ -1211,7 +1099,8 @@ function redraw(xPos) {
   //   Both arrows grow symmetrically with zoom — same model as Phase-1 bars.
   //   applyZoom() guarantees the instant column stays ≥ INSTANT_COL_W px, so
   //   the arrows are always visible at any zoom level.
-  const INSTANT_ICONS={'ProcessingCall':'⚙','ToolCall':'⚡','MemoryCall':'⛁','RAGQuery':'◐'};
+  const INSTANT_ICONS={'ProcessingCall':'⚙','ToolCall':'⚡','MemoryCall':'⛁','RAGQuery':'◐',
+    'BranchLink':'↳','GovernanceBlock':'⛔','GovernanceCaution':'⚑','GovernanceAllow':'⛨'};
   visibleLanes().forEach((lane,li)=>{
     const cy=TH+LGH+li*LH+LM;
     lane.sequence.filter(e=>e.type==='trans'&&e.isInstant).forEach(tr=>{
@@ -1250,18 +1139,34 @@ function redraw(xPos) {
           .attr('rx',2).attr('fill',tr.color).attr('stroke',C.stateS).attr('stroke-width',1)
           .style('cursor','pointer')
           .on('mousemove',e=>showTip(e,`${icon} ${tr.label}`,hoverContent,tr.callType)).on('mouseleave',hideTip)
-          .on('click',e=>{e.stopPropagation();pinTip(e,`${icon} ${tr.label}`,hoverContent,tr.callType);});
+          .on('click',e=>{e.stopPropagation();pinTip(e,`${icon} ${tr.label}`,hoverContent,tr.callType,null,null,null,'','',tr.governance);});
         ph4.append('text').attr('x',bx+BS/2).attr('y',by+BS/2+3.5)
           .attr('text-anchor','middle').attr('font-size',10).attr('fill','#fff')
           .attr('pointer-events','none').text(icon);
+        // Seq badge: an instant call still produces state and is part of the
+        // execution order, so it gets numbered exactly like Phase-1 bars —
+        // scaled down to fit the compact badge box.
+        const sbr=7, sbx=bx+BS-2, sby=by-sbr-1;
+        ph4.append('circle').attr('cx',sbx).attr('cy',sby).attr('r',sbr).attr('fill',C.badge);
+        ph4.append('text').attr('x',sbx).attr('y',sby+3).attr('text-anchor','middle')
+          .attr('font-size',7).attr('font-weight','bold').attr('fill','#fff')
+          .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
+          .text(tr.seq);
       } else {
         ph4.append('rect').attr('x',ix).attr('y',iy).attr('width',SW).attr('height',SH)
           .attr('rx',3).attr('fill',tr.color).attr('stroke',C.stateS).attr('stroke-width',1.5).style('cursor','pointer')
           .on('mousemove',e=>showTip(e,`${icon} ${tr.label}`,hoverContent,tr.callType)).on('mouseleave',hideTip)
-          .on('click',e=>{e.stopPropagation();pinTip(e,`${icon} ${tr.label}`,hoverContent,tr.callType);});
+          .on('click',e=>{e.stopPropagation();pinTip(e,`${icon} ${tr.label}`,hoverContent,tr.callType,null,null,null,'','',tr.governance);});
         ph4.append('text').attr('x',icx).attr('y',cy+4)
           .attr('text-anchor','middle').attr('font-size',12).attr('fill','#fff')
           .attr('pointer-events','none').text(icon);
+        // Seq badge — same treatment as Phase-1 bars (see above).
+        const sbx=ix+SW-BR*0.7, sby=iy-BR-1;
+        ph4.append('circle').attr('cx',sbx).attr('cy',sby).attr('r',BR).attr('fill',C.badge);
+        ph4.append('text').attr('x',sbx).attr('y',sby+4).attr('text-anchor','middle')
+          .attr('font-size',9).attr('font-weight','bold').attr('fill','#fff')
+          .attr('pointer-events','none').attr('font-family','ui-monospace,monospace')
+          .text(tr.seq);
       }
     });
   });
@@ -1441,6 +1346,19 @@ function init() {
   // Reflect initial showTimeAxis state in button style
   if (CHART.showTimeAxis) document.getElementById('btn-timeaxis').style.color='#7dd3fc';
   buildLaneTrack();
+  _syncGovLaneButton();
+}
+
+// Governance lane toggle: hidden by default (see hiddenLaneIds) to avoid
+// cluttering the main view — the same decisions/blocked-actions are already
+// on the per-call badges and ghost markers. The button only appears when the
+// trace actually produced a governance lane (nothing to toggle otherwise).
+function _syncGovLaneButton() {
+  const btn = document.getElementById('btn-gov-lane');
+  if (!btn) return;
+  const hasGovLane = CHART.lanes.some(l=>l.laneId==='governance');
+  btn.style.display = hasGovLane ? '' : 'none';
+  btn.style.color = hiddenLaneIds.has('governance') ? '' : '#7dd3fc';
 }
 
 // ── Zoom (Ctrl+wheel to scale; plain scroll = native horizontal scroll) ────
@@ -1472,7 +1390,6 @@ svg.call(zoomBeh).on('dblclick.zoom',null);
 function _rebuildChartState() {
   _HL_AGENTS = new Set((CHART.highlightAgents||[]).map(s=>s.toLowerCase()));
   _buildAllPins();
-  _buildInstantPairs();
   nLanes = CHART.lanes.length;
   laneFrom = 0;
   laneTo = nLanes - 1;
@@ -1481,6 +1398,8 @@ function _rebuildChartState() {
   totalW = Object.values(baseXPos).length ? Math.max(...Object.values(baseXPos))+PR : LW+PL+200;
   minZoom = computeMinZoom(baseXPos);
   currentXPos = baseXPos;
+  buildLaneTrack();
+  _syncGovLaneButton();
 }
 function _rebuildAnnotationsPanel() {
   const btnAnn = document.getElementById('btn-ann');
@@ -1549,6 +1468,16 @@ document.getElementById('btn-timeaxis').addEventListener('click',()=>{
   svg.attr('height',getH());
   redraw(currentXPos);
   document.getElementById('btn-timeaxis').style.color=CHART.showTimeAxis?'#7dd3fc':'';
+});
+document.getElementById('btn-gov-lane').addEventListener('click',()=>{
+  if (hiddenLaneIds.has('governance')) hiddenLaneIds.delete('governance');
+  else hiddenLaneIds.add('governance');
+  svg.attr('height',getH());
+  drawBg(totalW);
+  redraw(currentXPos);
+  drawFg(totalW);
+  buildLaneTrack();
+  _syncGovLaneButton();
 });
 document.getElementById('sel-mode').addEventListener('change',e=>{
   currentMode=e.target.value;
